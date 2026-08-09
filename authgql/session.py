@@ -1,0 +1,832 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
+import json
+import re
+
+from .analyzer import StaticAnalyzer
+from .authorization import AuthorizationEngine
+from .catalog import (
+    AuthorizationCatalog,
+    PolicyDescriptor,
+    PrivilegeFact,
+    Target,
+)
+from .errors import AuthorizationError, ExecutionError, ParseError
+from .executor import SecureExecutor
+from .metrics import ExecutionMetrics
+from .model import PropertyGraph
+from .parser import parse_query, strip_comments
+from .policy import compile_predicate
+
+
+_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_GRAPH_NAME = rf"(?:{_IDENTIFIER}|\*)"
+_ALL_DATA_ACTIONS = {
+    "ACCESS",
+    "TRAVERSE",
+    "READ",
+    "MATCH",
+    "INSERT",
+    "DELETE",
+    "SET",
+    "REMOVE",
+}
+_POLICY_ACTION_PHASE = {
+    "TRAVERSE": "OLD",
+    "READ": "OLD",
+    "DELETE": "OLD",
+    "INSERT": "NEW",
+    "SET": "DUAL",
+    "REMOVE": "DUAL",
+}
+
+
+def split_statements(source: str) -> list[str]:
+    """Split a script on semicolons without splitting quoted literals."""
+
+    cleaned = strip_comments(source)
+    statements: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(cleaned):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == ";":
+            statement = cleaned[start:index].strip()
+            if statement:
+                statements.append(statement)
+            start = index + 1
+    remainder = cleaned[start:].strip()
+    if remainder:
+        statements.append(remainder)
+    return statements
+
+
+def _split_names(text: str) -> list[tuple[str | None, str]]:
+    result: list[tuple[str | None, str]] = []
+    for raw in text.split(","):
+        item = raw.strip()
+        match = re.fullmatch(rf"(?:(USER|ROLE)\s+)?({_IDENTIFIER})", item, re.I)
+        if not match:
+            raise ParseError(f"Invalid grantee: {item!r}")
+        result.append(((match.group(1) or "").upper() or None, match.group(2)))
+    if not result:
+        raise ParseError("At least one grantee is required")
+    return result
+
+
+def _split_identifier_set(text: str) -> set[str]:
+    value = text.strip()
+    if value.startswith("{") and value.endswith("}"):
+        value = value[1:-1]
+    names = {item.strip() for item in value.split(",") if item.strip()}
+    if not names or not all(re.fullmatch(_IDENTIFIER, item) for item in names):
+        raise ParseError(f"Invalid identifier set: {text!r}")
+    return names
+
+
+def _parse_json_value(text: str) -> Any:
+    value = text.strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            return value[1:-1].replace("\\'", "'")
+        upper = value.upper()
+        if upper == "TRUE":
+            return True
+        if upper == "FALSE":
+            return False
+        if upper == "NULL":
+            return None
+        raise ParseError(f"Expected a JSON or GQL scalar value, got {text!r}")
+
+
+def _matching_parenthesis(text: str, opening: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(opening, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ParseError("Unclosed policy predicate")
+
+
+@dataclass(frozen=True)
+class ParsedPrivilege:
+    actions: frozenset[str]
+    target: Target
+    grantees: tuple[tuple[str | None, str], ...]
+    grant_option: bool = False
+    grant_option_only: bool = False
+    behavior: str = "RESTRICT"
+    effect: str = "PERMIT"
+
+
+class AuthGQLSession:
+    """Stateful front end over the catalog, analyzer, and secure executor.
+
+    The session distinguishes live catalog state from the authorization snapshot
+    fixed by BEGIN. Data and catalog changes are staged on clones and become
+    visible only on COMMIT. Individual executor updates are atomic as well.
+    """
+
+    def __init__(
+        self,
+        graphs: dict[str, PropertyGraph] | None = None,
+        catalog: AuthorizationCatalog | None = None,
+        user: str = "admin",
+        graph_name: str | None = None,
+        parameters: dict[str, Any] | None = None,
+        compare_reference: bool = False,
+    ) -> None:
+        self.graphs = graphs or {"default": PropertyGraph("default")}
+        if not self.graphs:
+            self.graphs = {"default": PropertyGraph("default")}
+        self.catalog = catalog or self.bootstrap_catalog(user)
+        self.user = user
+        self.graph_name = graph_name or next(iter(self.graphs))
+        if self.graph_name not in self.graphs:
+            raise ExecutionError(f"Working graph is not available: {self.graph_name!r}")
+        self.parameters = dict(parameters or {})
+        self.compare_reference = compare_reference
+        self.last_metrics = ExecutionMetrics()
+        self._in_transaction = False
+        self._transaction_mode = "READ WRITE"
+        self._working_graphs: dict[str, PropertyGraph] | None = None
+        self._authorization_snapshot: AuthorizationCatalog | None = None
+        self._staged_catalog: AuthorizationCatalog | None = None
+        self._catalog_dirty = False
+        self._graph_dirty = False
+        self._base_catalog_revision = self.catalog.revision
+
+    @staticmethod
+    def bootstrap_catalog(admin_user: str = "admin") -> AuthorizationCatalog:
+        catalog = AuthorizationCatalog(
+            roles={"admin": set()},
+            user_roles={admin_user: {"admin"}},
+            privileges=[
+                PrivilegeFact(
+                    admin_user,
+                    "PERMIT",
+                    frozenset({"ADMINISTER", *_ALL_DATA_ACTIONS}),
+                    Target("GRAPH", "*"),
+                    grant_option=True,
+                    grantor=admin_user,
+                    grantee_kind="USER",
+                )
+            ],
+        )
+        catalog.validate()
+        return catalog
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    def _active_graphs(self) -> dict[str, PropertyGraph]:
+        return self._working_graphs if self._working_graphs is not None else self.graphs
+
+    def _active_graph(self) -> PropertyGraph:
+        graphs = self._active_graphs()
+        if self.graph_name not in graphs:
+            raise ExecutionError(f"Working graph is not available: {self.graph_name!r}")
+        return graphs[self.graph_name]
+
+    def _authorization_catalog(self) -> AuthorizationCatalog:
+        return self._authorization_snapshot or self.catalog
+
+    def _mutation_catalog(self) -> AuthorizationCatalog:
+        return self._staged_catalog or self.catalog
+
+    def begin(self, mode: str = "READ WRITE") -> dict[str, Any]:
+        if self._in_transaction:
+            raise ExecutionError("A transaction is already active", code="25001")
+        mode = mode.upper()
+        if mode not in {"READ ONLY", "READ WRITE"}:
+            raise ParseError(f"Unsupported transaction access mode: {mode!r}")
+        self._in_transaction = True
+        self._transaction_mode = mode
+        self._working_graphs = {
+            name: graph.clone() for name, graph in self.graphs.items()
+        }
+        self._authorization_snapshot = self.catalog.clone()
+        self._staged_catalog = self.catalog.clone()
+        self._catalog_dirty = False
+        self._graph_dirty = False
+        self._base_catalog_revision = self.catalog.revision
+        return {
+            "status": "ok",
+            "transaction": "active",
+            "access_mode": mode,
+            "authorization_revision": self._authorization_snapshot.revision,
+        }
+
+    def commit(self) -> dict[str, Any]:
+        if not self._in_transaction:
+            raise ExecutionError("No active transaction", code="25000")
+        if self._catalog_dirty and self.catalog.revision != self._base_catalog_revision:
+            self.rollback()
+            raise ExecutionError(
+                "Authorization catalog changed concurrently; transaction rolled back",
+                code="40001",
+            )
+        if self._graph_dirty and self._working_graphs is not None:
+            for name, staged in self._working_graphs.items():
+                if name in self.graphs:
+                    self.graphs[name].replace_with(staged)
+                else:
+                    self.graphs[name] = staged.clone()
+        if self._catalog_dirty and self._staged_catalog is not None:
+            self.catalog.replace_with(self._staged_catalog)
+        revision = self.catalog.revision
+        self._clear_transaction()
+        return {
+            "status": "ok",
+            "transaction": "committed",
+            "catalog_revision": revision,
+        }
+
+    def rollback(self) -> dict[str, Any]:
+        if not self._in_transaction:
+            raise ExecutionError("No active transaction", code="25000")
+        self._clear_transaction()
+        return {"status": "ok", "transaction": "rolled back"}
+
+    def _clear_transaction(self) -> None:
+        self._in_transaction = False
+        self._transaction_mode = "READ WRITE"
+        self._working_graphs = None
+        self._authorization_snapshot = None
+        self._staged_catalog = None
+        self._catalog_dirty = False
+        self._graph_dirty = False
+
+    def _require_admin(self, graph: str = "*") -> None:
+        catalog = self._authorization_catalog()
+        target = Target("GRAPH", graph)
+        if not catalog.object_target_permitted(self.user, "ADMINISTER", target):
+            raise AuthorizationError(
+                f"Authorization identifier {self.user!r} lacks ADMINISTER", code="42000"
+            )
+
+    def _mutate_catalog(self, mutation: Callable[[AuthorizationCatalog], Any]) -> Any:
+        if self._transaction_mode == "READ ONLY":
+            self._require_admin()
+            raise ExecutionError(
+                "Catalog modification in a read-only GQL transaction", code="25G03"
+            )
+        candidate = self._mutation_catalog().clone()
+        result = mutation(candidate)
+        candidate.validate()
+        if self._in_transaction:
+            self._staged_catalog = candidate
+            self._catalog_dirty = True
+        else:
+            self.catalog.replace_with(candidate)
+        return result
+
+    def execute(self, statement: str) -> dict[str, Any]:
+        text = strip_comments(statement).strip().rstrip(";").strip()
+        if not text:
+            return {"status": "ok"}
+        upper = text.upper()
+
+        begin_match = re.fullmatch(
+            r"(?:START\s+TRANSACTION|BEGIN(?:\s+TRANSACTION)?)"
+            r"(?:\s+(READ\s+ONLY|READ\s+WRITE))?",
+            text,
+            re.I,
+        )
+        if begin_match:
+            return self.begin(begin_match.group(1) or "READ WRITE")
+        if re.fullmatch(r"COMMIT(?:\s+TRANSACTION)?", text, re.I):
+            return self.commit()
+        if re.fullmatch(r"ROLLBACK(?:\s+TRANSACTION)?", text, re.I):
+            return self.rollback()
+
+        use_match = re.fullmatch(rf"USE\s+GRAPH\s+({_GRAPH_NAME})|USE\s+({_GRAPH_NAME})", text, re.I)
+        if use_match:
+            graph_name = use_match.group(1) or use_match.group(2)
+            if graph_name not in self._active_graphs():
+                raise ExecutionError(
+                    f"Graph is not available to the session: {graph_name!r}", code="42000"
+                )
+            self.graph_name = graph_name
+            return {"status": "ok", "working_graph": graph_name}
+
+        # SET USER is a console meta-command, not proposed GQL syntax.
+        user_match = re.fullmatch(rf"SET\s+USER\s+({_IDENTIFIER})", text, re.I)
+        if user_match:
+            if self._in_transaction:
+                raise ExecutionError(
+                    "The session authorization identifier is fixed during a transaction",
+                    code="25001",
+                )
+            self.user = user_match.group(1)
+            return {"status": "ok", "session_authorization_identifier": self.user}
+
+        parameter_match = re.fullmatch(
+            rf"SET\s+PARAM(?:ETER)?\s+({_IDENTIFIER})\s*=\s*(.+)", text, re.I | re.S
+        )
+        if parameter_match:
+            self.parameters[parameter_match.group(1)] = _parse_json_value(
+                parameter_match.group(2)
+            )
+            return {
+                "status": "ok",
+                "parameter": parameter_match.group(1),
+                "value": self.parameters[parameter_match.group(1)],
+            }
+
+        if upper.startswith("SHOW AUTHORIZATION"):
+            full = self._authorization_catalog().object_target_permitted(
+                self.user, "ADMINISTER", Target("GRAPH", "*")
+            )
+            return {
+                "status": "ok",
+                # The transaction-start snapshot decides whether the caller may
+                # see full descriptors.  Successfully staged catalog changes are
+                # nevertheless visible to successor administrative statements.
+                "catalog": self._mutation_catalog().binding_tables(self.user, full=full),
+            }
+        if upper == "SHOW METRICS":
+            return {"status": "ok", "metrics": self.last_metrics.to_dict()}
+        if upper == "SHOW TRANSACTION":
+            return {
+                "status": "ok",
+                "active": self._in_transaction,
+                "access_mode": self._transaction_mode if self._in_transaction else None,
+                "authorization_revision": (
+                    self._authorization_snapshot.revision
+                    if self._authorization_snapshot is not None
+                    else self.catalog.revision
+                ),
+            }
+
+        explain_match = re.match(r"EXPLAIN(?:\s+AUTHORIZATION)?\s+(.+)$", text, re.I | re.S)
+        if explain_match:
+            query = parse_query(explain_match.group(1))
+            analyzer = StaticAnalyzer(
+                self._authorization_catalog(), self.graph_name, self.user
+            )
+            return {"status": "ok", "plan": analyzer.logical_plan(query)}
+
+        if re.fullmatch(rf"CREATE\s+ROLE\s+({_IDENTIFIER})", text, re.I):
+            return self._execute_create_role(text)
+        if re.match(r"DROP\s+ROLE\b", text, re.I):
+            return self._execute_drop_role(text)
+        if re.match(r"GRANT\b", text, re.I) and " ON GRAPH " not in f" {upper} ":
+            return self._execute_grant_role(text)
+        if re.match(r"REVOKE\s+ROLE\b", text, re.I):
+            return self._execute_revoke_role(text)
+        if re.match(r"(?:GRANT|DENY)\b", text, re.I):
+            return self._execute_grant_or_deny(text)
+        if re.match(r"REVOKE\b", text, re.I):
+            return self._execute_revoke_privilege(text)
+        if re.match(r"CREATE\s+(?:AUTHORIZATION\s+)?POLICY\b", text, re.I):
+            return self._execute_create_policy(text)
+        if re.match(r"ALTER\s+(?:AUTHORIZATION\s+)?POLICY\b", text, re.I):
+            return self._execute_alter_policy(text)
+        if re.match(r"DROP\s+(?:AUTHORIZATION\s+)?POLICY\b", text, re.I):
+            return self._execute_drop_policy(text)
+
+        query = parse_query(text)
+        graph = self._active_graph()
+        catalog = self._authorization_catalog()
+        if query.update_kind and self._transaction_mode == "READ ONLY":
+            metrics = ExecutionMetrics()
+            StaticAnalyzer(catalog, graph.name, self.user, metrics).preflight(query)
+            AuthorizationEngine(catalog, graph, self.user, self.parameters, metrics).check_access()
+            self.last_metrics = metrics
+            raise ExecutionError(
+                "Data modification in a read-only GQL transaction", code="25G03"
+            )
+        executor = SecureExecutor(
+            graph,
+            catalog,
+            self.user,
+            self.parameters,
+        )
+        result = executor.execute(query, compare_reference=self.compare_reference)
+        self.last_metrics = result.metrics
+        if result.updated and self._in_transaction:
+            self._graph_dirty = True
+        return result.to_dict()
+
+    # ---------- Authorization administration ----------
+
+    def _execute_create_role(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(rf"CREATE\s+ROLE\s+({_IDENTIFIER})", text, re.I)
+        assert match is not None
+        name = match.group(1)
+        self._mutate_catalog(lambda catalog: catalog.create_role(name))
+        return {"status": "ok", "created_role": name}
+
+    def _execute_drop_role(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(
+            rf"DROP\s+ROLE\s+({_IDENTIFIER})(?:\s+(RESTRICT|CASCADE))?", text, re.I
+        )
+        if not match:
+            raise ParseError("Expected DROP ROLE name [RESTRICT|CASCADE]")
+        name, behavior = match.group(1), (match.group(2) or "RESTRICT").upper()
+        self._mutate_catalog(lambda catalog: catalog.drop_role(name, behavior))
+        return {"status": "ok", "dropped_role": name, "behavior": behavior}
+
+    def _execute_grant_role(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(
+            rf"GRANT\s+(?:ROLE\s+)?({_IDENTIFIER})\s+TO\s+(?:(USER|ROLE)\s+)?({_IDENTIFIER})",
+            text,
+            re.I,
+        )
+        if not match:
+            raise ParseError("Expected GRANT [ROLE] role TO [USER|ROLE] member")
+        role, explicit_kind, member = match.group(1), match.group(2), match.group(3)
+        catalog = self._mutation_catalog()
+        member_kind = (explicit_kind or ("ROLE" if member in catalog.roles else "USER")).upper()
+        self._mutate_catalog(
+            lambda candidate: candidate.grant_role(role, member, member_kind)
+        )
+        return {
+            "status": "ok",
+            "granted_role": role,
+            "member": member,
+            "member_kind": member_kind,
+        }
+
+    def _execute_revoke_role(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(
+            rf"REVOKE\s+ROLE\s+({_IDENTIFIER})\s+FROM\s+(?:(USER|ROLE)\s+)?({_IDENTIFIER})",
+            text,
+            re.I,
+        )
+        if not match:
+            raise ParseError("Expected REVOKE ROLE role FROM [USER|ROLE] member")
+        role, explicit_kind, member = match.group(1), match.group(2), match.group(3)
+        catalog = self._mutation_catalog()
+        member_kind = (explicit_kind or ("ROLE" if member in catalog.roles else "USER")).upper()
+        self._mutate_catalog(
+            lambda candidate: candidate.revoke_role(role, member, member_kind)
+        )
+        return {"status": "ok", "revoked_role": role, "member": member}
+
+    def _parse_privilege(self, text: str, revoke: bool = False) -> ParsedPrivilege:
+        behavior = "RESTRICT"
+        grant_option = False
+        grant_option_only = False
+        source = text.strip()
+        revoke_effect = "PERMIT"
+        if revoke:
+            behavior_match = re.search(r"\s+(RESTRICT|CASCADE)\s*$", source, re.I)
+            if behavior_match:
+                behavior = behavior_match.group(1).upper()
+                source = source[: behavior_match.start()].rstrip()
+            prefix = re.match(
+                r"REVOKE\s+(?:(GRANT\s+OPTION\s+FOR|DENY)\s+)?",
+                source,
+                re.I,
+            )
+            if not prefix:
+                raise ParseError("Invalid REVOKE statement")
+            modifier = (prefix.group(1) or "").upper()
+            grant_option_only = modifier == "GRANT OPTION FOR"
+            revoke_effect = "DENY" if modifier == "DENY" else "PERMIT"
+            source = source[prefix.end() :]
+            recipient = "FROM"
+        else:
+            prefix = re.match(r"(GRANT|DENY)\s+", source, re.I)
+            if not prefix:
+                raise ParseError("Invalid GRANT or DENY statement")
+            verb = prefix.group(1).upper()
+            source = source[prefix.end() :]
+            option_match = re.search(r"\s+WITH\s+GRANT\s+OPTION\s*$", source, re.I)
+            if option_match:
+                if verb == "DENY":
+                    raise ParseError("DENY cannot carry WITH GRANT OPTION")
+                grant_option = True
+                source = source[: option_match.start()].rstrip()
+            recipient = "TO"
+
+        on_match = re.search(r"\s+ON\s+GRAPH\s+", source, re.I)
+        if not on_match:
+            raise ParseError("Privilege statements require ON GRAPH")
+        action_text = source[: on_match.start()].strip()
+        remainder = source[on_match.end() :]
+        recipient_match = re.search(rf"\s+{recipient}\s+", remainder, re.I)
+        if not recipient_match:
+            raise ParseError(f"Privilege statement requires {recipient}")
+        target_text = remainder[: recipient_match.start()].strip()
+        grantee_text = remainder[recipient_match.end() :].strip()
+
+        graph_match = re.match(rf"({_GRAPH_NAME})(?:\s+(.*))?$", target_text, re.I | re.S)
+        if not graph_match:
+            raise ParseError(f"Invalid graph target: {target_text!r}")
+        graph = graph_match.group(1)
+        target_tail = (graph_match.group(2) or "").strip()
+
+        property_match = re.search(r"\bPROPERTIES\s*\{([^}]*)\}", action_text, re.I)
+        if property_match:
+            properties = _split_identifier_set(property_match.group(1))
+            action_text = (
+                action_text[: property_match.start()] + action_text[property_match.end() :]
+            ).strip()
+        else:
+            property_match = re.search(r"\bPROPERTIES\s*\{([^}]*)\}", target_tail, re.I)
+            properties = _split_identifier_set(property_match.group(1)) if property_match else set()
+            if property_match:
+                target_tail = (
+                    target_tail[: property_match.start()] + target_tail[property_match.end() :]
+                ).strip()
+
+        actions = frozenset(item.strip().upper() for item in action_text.split(",") if item.strip())
+        if not actions or not all(re.fullmatch(r"[A-Z_]+", item) for item in actions):
+            raise ParseError(f"Invalid privilege action list: {action_text!r}")
+
+        labels: set[str] = set()
+        edge_types: set[str] = set()
+        kind = "GRAPH"
+        if target_tail:
+            class_match = re.fullmatch(r"(NODES|EDGES)\s+(.+)", target_tail, re.I | re.S)
+            if not class_match:
+                raise ParseError(f"Invalid authorization target: {target_tail!r}")
+            class_names = _split_identifier_set(class_match.group(2))
+            if class_match.group(1).upper() == "NODES":
+                labels = class_names
+                kind = "NODES"
+            else:
+                edge_types = class_names
+                kind = "EDGES"
+        if properties:
+            kind = "PROPERTIES"
+        target = Target(
+            kind,
+            graph,
+            labels=frozenset(labels),
+            edge_types=frozenset(edge_types),
+            properties=frozenset(properties),
+        )
+        return ParsedPrivilege(
+            actions=actions,
+            target=target,
+            grantees=tuple(_split_names(grantee_text)),
+            grant_option=grant_option,
+            grant_option_only=grant_option_only,
+            behavior=behavior,
+            effect=revoke_effect,
+        )
+
+    def _execute_grant_or_deny(self, text: str) -> dict[str, Any]:
+        parsed = self._parse_privilege(text)
+        effect = "DENY" if text.lstrip().upper().startswith("DENY") else "PERMIT"
+        if parsed.grant_option and (
+            len(parsed.grantees) != 1 or parsed.grantees[0][0] != "USER"
+        ):
+            raise ParseError(
+                "WITH GRANT OPTION requires exactly one explicitly typed USER grantee"
+            )
+        if effect == "DENY":
+            self._require_admin(parsed.target.graph)
+        else:
+            for action in parsed.actions:
+                if not self._authorization_catalog().delegation_permitted(
+                    self.user, action, parsed.target
+                ):
+                    raise AuthorizationError(
+                        f"{self.user!r} cannot delegate {action} on {parsed.target.to_dict()}",
+                        code="42000",
+                    )
+
+        def mutation(catalog: AuthorizationCatalog) -> None:
+            for explicit_kind, grantee in parsed.grantees:
+                grantee_kind = (
+                    explicit_kind
+                    or ("ROLE" if grantee in catalog.roles else "USER")
+                )
+                catalog.add_privilege(
+                    PrivilegeFact(
+                        grantee=grantee,
+                        effect=effect,
+                        actions=parsed.actions,
+                        target=parsed.target,
+                        grant_option=parsed.grant_option,
+                        grantor=self.user,
+                        grantee_kind=grantee_kind,
+                    )
+                )
+
+        self._mutate_catalog(mutation)
+        return {
+            "status": "ok",
+            "effect": effect,
+            "actions": sorted(parsed.actions),
+            "target": parsed.target.to_dict(),
+            "grantees": [name for _kind, name in parsed.grantees],
+            "typed_grantees": [
+                {
+                    "kind": kind
+                    or ("ROLE" if name in self._mutation_catalog().roles else "USER"),
+                    "name": name,
+                }
+                for kind, name in parsed.grantees
+            ],
+            "grant_option": parsed.grant_option,
+        }
+
+    def _execute_revoke_privilege(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        parsed = self._parse_privilege(text, revoke=True)
+
+        def mutation(catalog: AuthorizationCatalog) -> int:
+            changed = 0
+            for explicit_kind, grantee in parsed.grantees:
+                grantee_kind = (
+                    explicit_kind
+                    or ("ROLE" if grantee in catalog.roles else "USER")
+                )
+                changed += catalog.revoke_privilege(
+                    grantee,
+                    parsed.actions,
+                    parsed.target,
+                    grantee_kind=grantee_kind,
+                    effect=parsed.effect,
+                    grant_option_only=parsed.grant_option_only,
+                    behavior=parsed.behavior,
+                )
+            return changed
+
+        changed = self._mutate_catalog(mutation)
+        return {
+            "status": "ok",
+            "revoked_facts": changed,
+            "behavior": parsed.behavior,
+            "grant_option_only": parsed.grant_option_only,
+            "effect": parsed.effect,
+        }
+
+    def _execute_create_policy(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        header = re.match(
+            rf"CREATE\s+(?:AUTHORIZATION\s+)?POLICY\s+({_IDENTIFIER})\s+"
+            rf"ON\s+GRAPH\s+({_GRAPH_NAME})(?:\s+(NODES|EDGES)\s+({_IDENTIFIER}))?\s+"
+            rf"FOR\s+(.+?)\s+TO\s+(.+?)\s+EFFECT\s+(PERMIT|DENY)\b(.*)$",
+            text,
+            re.I | re.S,
+        )
+        if not header:
+            raise ParseError(
+                "Expected CREATE AUTHORIZATION POLICY name ON GRAPH graph "
+                "[NODES label|EDGES label] FOR actions TO grantees EFFECT PERMIT|DENY"
+            )
+        name, graph, target_kind, target_name = header.group(1, 2, 3, 4)
+        actions = {item.strip().upper() for item in header.group(5).split(",") if item.strip()}
+        unknown_actions = actions.difference(_POLICY_ACTION_PHASE)
+        if not actions or unknown_actions:
+            raise ParseError(
+                f"Unsupported policy action(s): {sorted(unknown_actions) if unknown_actions else []}"
+            )
+        phases = {_POLICY_ACTION_PHASE[action] for action in actions}
+        if len(phases) != 1:
+            raise ParseError("Policy actions must belong to one evaluation phase")
+        phase = next(iter(phases))
+        parsed_grantees = _split_names(header.group(6))
+        grantees = {grantee for _kind, grantee in parsed_grantees}
+        if len(grantees) != len(parsed_grantees):
+            raise ParseError("A policy cannot name the same grantee more than once")
+        catalog_roles = self._mutation_catalog().roles
+        grantee_kinds = {
+            grantee: explicit_kind
+            or ("ROLE" if grantee in catalog_roles else "USER")
+            for explicit_kind, grantee in parsed_grantees
+        }
+        effect = header.group(7).upper()
+        tail = header.group(8).strip()
+        using: Any = True
+        with_check: Any = True
+        dependencies: set[str] = {f"graph:{graph}"}
+        has_using = False
+        has_with_check = False
+
+        while tail:
+            using_match = re.match(r"USING\s*\(", tail, re.I)
+            check_match = re.match(r"WITH\s+CHECK\s*\(", tail, re.I)
+            dependency_match = re.match(r"DEPENDS\s+ON\s*\{([^}]*)\}", tail, re.I | re.S)
+            if using_match:
+                if has_using:
+                    raise ParseError("USING may occur at most once")
+                has_using = True
+                opening = tail.find("(", using_match.start())
+                closing = _matching_parenthesis(tail, opening)
+                using = tail[opening + 1 : closing].strip()
+                tail = tail[closing + 1 :].strip()
+            elif check_match:
+                if has_with_check:
+                    raise ParseError("WITH CHECK may occur at most once")
+                has_with_check = True
+                opening = tail.find("(", check_match.start())
+                closing = _matching_parenthesis(tail, opening)
+                with_check = tail[opening + 1 : closing].strip()
+                tail = tail[closing + 1 :].strip()
+            elif dependency_match:
+                dependencies.update({
+                    item.strip() for item in dependency_match.group(1).split(",") if item.strip()
+                })
+                tail = tail[dependency_match.end() :].strip()
+            else:
+                raise ParseError(f"Cannot parse policy clause near: {tail!r}")
+
+        if phase == "OLD" and has_with_check:
+            raise ParseError("WITH CHECK is not applicable to an old-state-only policy")
+        if phase == "NEW" and has_using:
+            raise ParseError("USING is not applicable to an INSERT policy")
+
+        compile_predicate(using)
+        compile_predicate(with_check)
+        selector: dict[str, Any] = {}
+        if target_kind and target_kind.upper() == "NODES":
+            selector = {"kind": "NODE", "labels": [target_name]}
+        elif target_kind:
+            selector = {"kind": "EDGE", "edge_types": [target_name]}
+        policy = PolicyDescriptor(
+            name=name,
+            graph=graph,
+            actions=actions,
+            grantees=grantees,
+            effect=effect,
+            selector=selector,
+            using=using,
+            with_check=with_check,
+            dependencies=dependencies,
+            owner=self.user,
+            grantee_kinds=grantee_kinds,
+        )
+        self._mutate_catalog(lambda catalog: catalog.add_policy(policy))
+        return {"status": "ok", "created_policy": name, "policy": policy.to_dict()}
+
+    def _execute_alter_policy(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(
+            rf"ALTER\s+(?:AUTHORIZATION\s+)?POLICY\s+({_IDENTIFIER})\s+(ENABLE|DISABLE)",
+            text,
+            re.I,
+        )
+        if not match:
+            raise ParseError("Expected ALTER AUTHORIZATION POLICY name ENABLE|DISABLE")
+        name, enabled = match.group(1), match.group(2).upper() == "ENABLE"
+        self._mutate_catalog(
+            lambda catalog: catalog.set_policy_enabled(name, enabled)
+        )
+        return {"status": "ok", "policy": name, "enabled": enabled}
+
+    def _execute_drop_policy(self, text: str) -> dict[str, Any]:
+        self._require_admin()
+        match = re.fullmatch(
+            rf"DROP\s+(?:AUTHORIZATION\s+)?POLICY\s+({_IDENTIFIER})"
+            r"(?:\s+(RESTRICT|CASCADE))?",
+            text,
+            re.I,
+        )
+        if not match:
+            raise ParseError(
+                "Expected DROP AUTHORIZATION POLICY name [RESTRICT|CASCADE]"
+            )
+        name, behavior = match.group(1), (match.group(2) or "RESTRICT").upper()
+        removed = self._mutate_catalog(
+            lambda catalog: catalog.drop_policy(name, behavior)
+        )
+        return {"status": "ok", "dropped_policies": removed, "behavior": behavior}

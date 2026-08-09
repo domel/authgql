@@ -1,0 +1,77 @@
+{
+  "name": "hospital",
+  "nodes": [
+    {
+      "id": "user_alice",
+      "labels": ["User"],
+      "properties": {"login": "alice", "display_name": "Alice Clinician"}
+    },
+    {
+      "id": "user_rita",
+      "labels": ["User"],
+      "properties": {"login": "rita", "display_name": "Rita Researcher"}
+    },
+    {
+      "id": "hospital_h1",
+      "labels": ["Hospital"],
+      "properties": {"code": "H1", "name": "North Hospital"}
+    },
+    {
+      "id": "hospital_h2",
+      "labels": ["Hospital"],
+      "properties": {"code": "H2", "name": "South Hospital"}
+    },
+    {
+      "id": "patient_visible",
+      "labels": ["Patient"],
+      "properties": {
+        "name": "Visible Patient",
+        "age": 42,
+        "address": "North Street 1",
+        "national_id": "H1-001",
+        "classification": "normal"
+      }
+    },
+    {
+      "id": "patient_remote",
+      "labels": ["Patient"],
+      "properties": {
+        "name": "Remote Patient",
+        "age": 51,
+        "address": "South Street 2",
+        "national_id": "H2-002",
+        "classification": "normal"
+      }
+    },
+    {
+      "id": "patient_sealed",
+      "labels": ["Patient"],
+      "properties": {
+        "name": "Sealed Patient",
+        "age": 37,
+        "address": "Restricted",
+        "national_id": "H1-003",
+        "classification": "sealed"
+      }
+    },
+    {
+      "id": "diagnosis_a",
+      "labels": ["Diagnosis"],
+      "properties": {"code": "D-A", "description": "Example diagnosis A"}
+    },
+    {
+      "id": "diagnosis_b",
+      "labels": ["Diagnosis"],
+      "properties": {"code": "D-B", "description": "Example diagnosis B"}
+    }
+  ],
+  "edges": [
+    {"id": "works_alice_h1", "type": "WORKS_AT", "source": "user_alice", "target": "hospital_h1"},
+    {"id": "works_rita_h1", "type": "WORKS_AT", "source": "user_rita", "target": "hospital_h1"},
+    {"id": "treated_visible_h1", "type": "TREATED_AT", "source": "patient_visible", "target": "hospital_h1"},
+    {"id": "treated_remote_h2", "type": "TREATED_AT", "source": "patient_remote", "target": "hospital_h2"},
+    {"id": "treated_sealed_h1", "type": "TREATED_AT", "source": "patient_sealed", "target": "hospital_h1"},
+    {"id": "diagnosis_visible", "type": "HAS_DIAGNOSIS", "source": "patient_visible", "target": "diagnosis_a"},
+    {"id": "diagnosis_sealed", "type": "HAS_DIAGNOSIS", "source": "patient_sealed", "target": "diagnosis_b"}
+  ]
+}

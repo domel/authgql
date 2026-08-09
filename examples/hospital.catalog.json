@@ -1,0 +1,144 @@
+{
+  "roles": {
+    "clinician": {"inherits": []},
+    "researcher": {"inherits": []},
+    "senior_clinician": {"inherits": ["clinician"]}
+  },
+  "user_roles": {
+    "alice": ["clinician"],
+    "rita": ["researcher"]
+  },
+  "privileges": [
+    {
+      "grantee": "clinician",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["ACCESS", "MATCH"],
+      "target": {"kind": "GRAPH", "graph": "hospital"},
+      "grant_option": false,
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "clinician",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["SET", "REMOVE"],
+      "target": {
+        "kind": "NODES",
+        "graph": "hospital",
+        "labels": ["Patient"]
+      },
+      "grant_option": false,
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "researcher",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["ACCESS", "TRAVERSE"],
+      "target": {"kind": "GRAPH", "graph": "hospital"},
+      "grant_option": false,
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "researcher",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["READ"],
+      "target": {
+        "kind": "PROPERTIES",
+        "graph": "hospital",
+        "labels": ["User"],
+        "properties": ["login"]
+      },
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "researcher",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["READ"],
+      "target": {
+        "kind": "PROPERTIES",
+        "graph": "hospital",
+        "labels": ["Patient"],
+        "properties": ["age"]
+      },
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "researcher",
+      "grantee_kind": "ROLE",
+      "effect": "PERMIT",
+      "actions": ["READ"],
+      "target": {
+        "kind": "PROPERTIES",
+        "graph": "hospital",
+        "labels": ["Diagnosis"],
+        "properties": ["code", "description"]
+      },
+      "grantor": "security_admin"
+    },
+    {
+      "grantee": "researcher",
+      "grantee_kind": "ROLE",
+      "effect": "DENY",
+      "actions": ["READ"],
+      "target": {
+        "kind": "PROPERTIES",
+        "graph": "hospital",
+        "labels": ["Patient"],
+        "properties": ["name", "address", "national_id"]
+      },
+      "grantor": "security_admin"
+    }
+  ],
+  "policies": [
+    {
+      "name": "local_patient_visibility",
+      "graph": "hospital",
+      "actions": ["TRAVERSE", "READ"],
+      "grantees": ["clinician", "researcher"],
+      "grantee_kinds": {"clinician": "ROLE", "researcher": "ROLE"},
+      "effect": "PERMIT",
+      "selector": {"kind": "NODE", "labels": ["Patient"]},
+      "using": "EXISTS { MATCH (u:User {login: SESSION_USER})-[:WORKS_AT]->(h:Hospital) MATCH (RESOURCE:Patient)-[:TREATED_AT]->(h) }",
+      "with_check": true,
+      "dependencies": ["graph:hospital"],
+      "owner": "security_admin",
+      "enabled": true
+    },
+    {
+      "name": "sealed_patient_denial",
+      "graph": "hospital",
+      "actions": ["TRAVERSE", "READ"],
+      "grantees": ["clinician", "researcher"],
+      "grantee_kinds": {"clinician": "ROLE", "researcher": "ROLE"},
+      "effect": "DENY",
+      "selector": {"kind": "NODE", "labels": ["Patient"]},
+      "using": "RESOURCE.classification = 'sealed' AND NOT EXISTS { MATCH (u:User {login: SESSION_USER})-[:HAS_CLEARANCE]->(c:Clearance {level:'sealed'}) }",
+      "with_check": true,
+      "dependencies": ["graph:hospital"],
+      "owner": "security_admin",
+      "enabled": true
+    },
+    {
+      "name": "local_patient_update",
+      "graph": "hospital",
+      "actions": ["SET", "REMOVE"],
+      "grantees": ["clinician"],
+      "grantee_kinds": {"clinician": "ROLE"},
+      "effect": "PERMIT",
+      "selector": {"kind": "NODE", "labels": ["Patient"]},
+      "using": "EXISTS { MATCH (u:User {login: SESSION_USER})-[:WORKS_AT]->(h:Hospital) MATCH (RESOURCE:Patient)-[:TREATED_AT]->(h) }",
+      "with_check": "NEW_RESOURCE.classification <> 'sealed'",
+      "dependencies": ["graph:hospital"],
+      "owner": "security_admin",
+      "enabled": true
+    }
+  ],
+  "metadata": {
+    "description": "Reproducible healthcare scenario used by the AuthGQL prototype"
+  },
+  "revision": 1
+}

@@ -1,0 +1,19 @@
+USE GRAPH hospital;
+
+MATCH (u:User {login: SESSION_USER})-[:WORKS_AT]->(h:Hospital)
+MATCH (p:Patient)-[:TREATED_AT]->(h)
+OPTIONAL MATCH (p)-[:HAS_DIAGNOSIS]->(d:Diagnosis)
+RETURN p.age AS age, d.code AS diagnosis
+ORDER BY age;
+
+EXPLAIN AUTHORIZATION
+MATCH (p:Patient)-[:HAS_DIAGNOSIS*1..3]->(d:Diagnosis)
+RETURN d.code AS code;
+
+MATCH (p:Patient)-[:TREATED_AT]->(h:Hospital)
+WHERE p.age = 42
+SET p.classification = 'review'
+RETURN p.classification AS classification;
+
+SHOW METRICS;
+SHOW AUTHORIZATION;
