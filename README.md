@@ -4,6 +4,8 @@ AuthGQL is an in-memory reference implementation of graph authorization with
 GQL-style patterns, role administration, `TRAVERSE` and `READ` privileges, and
 old-state `USING` and proposed-state `WITH CHECK` policies.
 
+Publication record: [https://doi.org/10.6084/m9.figshare.33544702](https://doi.org/10.6084/m9.figshare.33544702)
+
 ## Requirements
 
 - Python 3.10 or later
