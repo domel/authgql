@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .errors import CatalogError
-from .model import Edge, GraphElement, Node, PropertyGraph
+from .model import Edge, GraphElement, Node, PropertyGraph, PathValue
+from .values import compare as typed_compare, parameter
+from .validation import expression_type, require
 from .parser import (
     BinaryExpr,
     ContextValue,
@@ -32,6 +34,12 @@ class PolicyEvaluationContext:
     parameters: dict[str, Any] = field(default_factory=dict)
     resource: GraphElement | None = None
     new_resource: GraphElement | None = None
+    remaining_steps: int = 100_000
+
+    def tick(self) -> None:
+        self.remaining_steps -= 1
+        if self.remaining_steps < 0:
+            raise CatalogError("Policy evaluation budget exhausted")
 
 
 TruthValue = bool | None
@@ -41,9 +49,7 @@ Predicate = Callable[[PropertyGraph, PolicyEvaluationContext], TruthValue]
 def _as_truth(value: Any) -> TruthValue:
     if value is True or value is False or value is None:
         return value
-    raise CatalogError(
-        f"Policy Boolean expression produced a non-Boolean value: {value!r}"
-    )
+    raise CatalogError(f"Policy Boolean expression produced a non-Boolean value: {value!r}")
 
 
 def _truth_not(value: Any) -> TruthValue:
@@ -72,38 +78,12 @@ def _truth_or(left: Any, right: Any) -> TruthValue:
 
 
 def _compare(left: Any, op: str, right: Any) -> TruthValue:
-    op = op.upper()
-    if op == "IN":
-        if right is None:
-            return None
-        if not isinstance(right, (list, tuple, set, frozenset)):
-            raise CatalogError("The right operand of IN must be a list")
-        saw_unknown = False
-        for candidate in right:
-            comparison = _compare(left, "=", candidate)
-            if comparison is True:
-                return True
-            if comparison is None:
-                saw_unknown = True
-        return None if saw_unknown else False
-    if left is None or right is None:
-        return None
-    if op in {"=", "=="}:
-        return left == right
-    if op in {"<>", "!="}:
-        return left != right
-    if op == "<":
-        return left < right
-    if op == "<=":
-        return left <= right
-    if op == ">":
-        return left > right
-    if op == ">=":
-        return left >= right
-    raise CatalogError(f"Unsupported policy comparison operator: {op}")
+    return typed_compare(left, op, right)
 
 
 def _source(context: PolicyEvaluationContext, name: str) -> Any:
+    if name.upper().startswith("PARAM:"):
+        return parameter(context.parameters, name.split(":", 1)[1])
     name = name.upper()
     if name == "RESOURCE":
         return context.resource
@@ -112,11 +92,12 @@ def _source(context: PolicyEvaluationContext, name: str) -> Any:
     if name == "SESSION_USER":
         return context.user
     if name.startswith("PARAM:"):
-        return context.parameters.get(name.split(":", 1)[1])
+        return parameter(context.parameters, name.split(":", 1)[1])
     raise CatalogError(f"Unknown policy source: {name}")
 
 
 def _node_matches(node: Node, spec: dict[str, Any], context: PolicyEvaluationContext) -> bool:
+    context.tick()
     labels = set(map(str, spec.get("labels", [])))
     if "label" in spec:
         labels.add(str(spec["label"]))
@@ -129,13 +110,15 @@ def _node_matches(node: Node, spec: dict[str, Any], context: PolicyEvaluationCon
         if expected == "SESSION_USER":
             expected = context.user
         elif isinstance(expected, str) and expected.startswith("PARAM:"):
-            expected = context.parameters.get(expected.split(":", 1)[1])
+            expected = parameter(context.parameters, expected.split(":", 1)[1])
         if _compare(node.properties.get(key), "=", expected) is not True:
             return False
     return True
 
 
-def _path_exists(graph: PropertyGraph, spec: dict[str, Any], context: PolicyEvaluationContext) -> bool:
+def _path_exists(
+    graph: PropertyGraph, spec: dict[str, Any], context: PolicyEvaluationContext
+) -> bool:
     start_spec = spec.get("start", {})
     starts: list[Node] = []
     if isinstance(start_spec, str):
@@ -158,7 +141,8 @@ def _path_exists(graph: PropertyGraph, spec: dict[str, Any], context: PolicyEval
         edge_props = step.get("properties", {})
         for node in current:
             for edge, neighbour in graph.adjacent(node.id, direction):
-                if edge_type and edge.type != edge_type:
+                context.tick()
+                if edge_type and edge_type not in edge.labels:
                     continue
                 if any(
                     _compare(edge.properties.get(key), "=", value) is not True
@@ -187,6 +171,8 @@ def _resolve_context_value(value: Any, context: PolicyEvaluationContext) -> Any:
         return value
     if value.name == "SESSION_USER":
         return context.user
+    if value.name.startswith("$"):
+        return parameter(context.parameters, value.name[1:])
     return None
 
 
@@ -195,6 +181,7 @@ def _gql_pattern_node_matches(
     pattern: PatternNode,
     context: PolicyEvaluationContext,
 ) -> bool:
+    context.tick()
     if pattern.labels and not pattern.labels.issubset(node.labels):
         return False
     return all(
@@ -215,33 +202,52 @@ def _gql_expand_pattern(
     edge_index: int,
     row: dict[str, Any],
     context: PolicyEvaluationContext,
-) -> list[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], PathValue]]:
     edge_pattern = pattern.edges[edge_index]
     node_pattern = pattern.nodes[edge_index + 1]
-    output: list[dict[str, Any]] = []
-    if edge_pattern.min_hops == 0 and _gql_pattern_node_matches(start, node_pattern, context):
+    output = []
+    bound_node = row.get(node_pattern.variable)
+    node_is_bound = node_pattern.variable in row
+    edge_is_bound = bool(edge_pattern.variable and edge_pattern.variable in row)
+    bound_edge = row.get(edge_pattern.variable) if edge_pattern.variable else None
+    if edge_pattern.min_hops == 0:
         candidate_row = dict(row)
-        node_is_bound = node_pattern.variable in candidate_row
-        bound = candidate_row.get(node_pattern.variable)
-        if (not node_is_bound) or (
-            isinstance(bound, Node) and bound.id == start.id
+        node_ok = not node_is_bound or (isinstance(bound_node, Node) and bound_node.id == start.id)
+        edge_ok = (
+            not edge_pattern.variable
+            or edge_pattern.variable not in row
+            or row[edge_pattern.variable] == []
+        )
+        if (
+            node_ok
+            and edge_ok
+            and _gql_pattern_node_matches(
+                bound_node if isinstance(bound_node, Node) else start, node_pattern, context
+            )
         ):
-            candidate_row[node_pattern.variable] = start
-            if edge_pattern.variable:
+            if not node_is_bound:
+                candidate_row[node_pattern.variable] = start
+            if edge_pattern.variable and not edge_is_bound:
                 candidate_row[edge_pattern.variable] = []
-            output.append(candidate_row)
+            output.append((candidate_row, PathValue((start.id,), ())))
 
-    frontier: list[tuple[Node, list[Edge]]] = [(start, [])]
+    frontier: list[tuple[Node, list[Edge], list[str]]] = [(start, [], [start.id])]
     while frontier:
-        current, path = frontier.pop()
+        current, path, path_nodes = frontier.pop()
         if len(path) >= edge_pattern.max_hops:
             continue
         for edge, neighbour in graph.adjacent(current.id, edge_pattern.direction):
-            if edge_pattern.edge_type and edge.type != edge_pattern.edge_type:
+            context.tick()
+            if not edge_pattern.required_labels.issubset(edge.labels):
                 continue
+            # A correlated binding retains its supplied version, including the
+            # old RESOURCE in WITH CHECK; the phase graph supplies topology.
+            edge_for_test = (
+                bound_edge if isinstance(bound_edge, Edge) and bound_edge.id == edge.id else edge
+            )
             if any(
                 _compare(
-                    edge.properties.get(name),
+                    edge_for_test.properties.get(name),
                     "=",
                     _resolve_context_value(expected, context),
                 )
@@ -250,41 +256,40 @@ def _gql_expand_pattern(
             ):
                 continue
             new_path = [*path, edge]
-            if len(new_path) >= edge_pattern.min_hops and _gql_pattern_node_matches(
-                neighbour, node_pattern, context
+            node_ok = (not node_is_bound) or (
+                isinstance(bound_node, Node) and bound_node.id == neighbour.id
+            )
+            if (
+                len(new_path) >= edge_pattern.min_hops
+                and node_ok
+                and _gql_pattern_node_matches(
+                    bound_node if isinstance(bound_node, Node) else neighbour, node_pattern, context
+                )
             ):
                 candidate_row = dict(row)
-                node_is_bound = node_pattern.variable in candidate_row
-                bound_node = candidate_row.get(node_pattern.variable)
-                edge_is_bound = bool(
-                    edge_pattern.variable
-                    and edge_pattern.variable in candidate_row
-                )
-                bound_edge = (
-                    candidate_row.get(edge_pattern.variable)
-                    if edge_pattern.variable
-                    else None
-                )
                 edge_value: Edge | list[Edge] = (
-                    new_path[0]
-                    if edge_pattern.min_hops == edge_pattern.max_hops == 1
-                    else new_path
-                )
-                node_ok = (not node_is_bound) or (
-                    isinstance(bound_node, Node) and bound_node.id == neighbour.id
+                    new_path[0] if not edge_pattern.quantified else new_path
                 )
                 edge_ok = (
                     not edge_pattern.variable
                     or not edge_is_bound
-                    or bound_edge == edge_value
+                    or _compare(bound_edge, "=", edge_value) is True
                 )
                 if node_ok and edge_ok:
-                    candidate_row[node_pattern.variable] = neighbour
-                    if edge_pattern.variable:
+                    if not node_is_bound:
+                        candidate_row[node_pattern.variable] = neighbour
+                    if edge_pattern.variable and not edge_is_bound:
                         candidate_row[edge_pattern.variable] = edge_value
-                    output.append(candidate_row)
+                    output.append(
+                        (
+                            candidate_row,
+                            PathValue(
+                                tuple([*path_nodes, neighbour.id]), tuple(e.id for e in new_path)
+                            ),
+                        )
+                    )
             if len(new_path) < edge_pattern.max_hops:
-                frontier.append((neighbour, new_path))
+                frontier.append((neighbour, new_path, [*path_nodes, neighbour.id]))
     return output
 
 
@@ -307,24 +312,46 @@ def _gql_match_clause(
         for start in starts:
             if not _gql_pattern_node_matches(start, first_pattern, context):
                 continue
-            states = [dict(input_row, **{first_pattern.variable: start})]
+            states = [
+                (dict(input_row, **{first_pattern.variable: start}), PathValue((start.id,), ()))
+            ]
             for edge_index in range(len(pattern.edges)):
-                next_states: list[dict[str, Any]] = []
-                for state in states:
+                next_states: list[tuple[dict[str, Any], PathValue]] = []
+                for state, prefix in states:
                     current = state.get(pattern.nodes[edge_index].variable)
                     if isinstance(current, Node):
-                        next_states.extend(
-                            _gql_expand_pattern(
-                                graph, current, pattern, edge_index, state, context
+                        for candidate, suffix in _gql_expand_pattern(
+                            graph, current, pattern, edge_index, state, context
+                        ):
+                            next_states.append(
+                                (
+                                    candidate,
+                                    PathValue(
+                                        prefix.nodes + suffix.nodes[1:], prefix.edges + suffix.edges
+                                    ),
+                                )
                             )
-                        )
                 states = next_states
-            matches.extend(states)
+            for candidate, path in states:
+                if pattern.path_variable:
+                    if (
+                        pattern.path_variable in candidate
+                        and candidate[pattern.path_variable] != path
+                    ):
+                        continue
+                    candidate[pattern.path_variable] = path
+                matches.append(
+                    {
+                        key: value
+                        for key, value in candidate.items()
+                        if key not in {n.variable for n in pattern.nodes if n.anonymous}
+                    }
+                )
         if matches:
             output.extend(matches)
         elif clause.optional:
             padded = dict(input_row)
-            for variable in pattern.variables:
+            for variable in pattern.variables - {n.variable for n in pattern.nodes if n.anonymous}:
                 padded.setdefault(variable, None)
             output.append(padded)
     return output
@@ -336,20 +363,31 @@ def _eval_gql_expr(
     context: PolicyEvaluationContext,
     row: dict[str, Any],
 ) -> Any:
+    context.tick()
     if isinstance(expr, Literal):
         return expr.value
     if isinstance(expr, VariableRef):
+        if expr.name.startswith("$"):
+            return parameter(context.parameters, expr.name[1:])
         if expr.name.upper() == "SESSION_USER":
             return context.user
         return row.get(expr.name)
     if isinstance(expr, PropertyRef):
         resource = row.get(expr.variable)
-        return resource.properties.get(expr.property_name) if isinstance(resource, (Node, Edge)) else None
+        return (
+            resource.properties.get(expr.property_name)
+            if isinstance(resource, (Node, Edge))
+            else None
+        )
     if isinstance(expr, LabelTest):
         resource = row.get(expr.variable)
         if isinstance(resource, Node):
             return expr.label in resource.labels
-        return isinstance(resource, Edge) and resource.type == expr.label
+        return (
+            None
+            if resource is None
+            else isinstance(resource, Edge) and expr.label in resource.labels
+        )
     if isinstance(expr, UnaryExpr):
         value = _eval_gql_expr(expr.operand, graph, context, row)
         if expr.op == "NOT":
@@ -372,9 +410,7 @@ def _eval_gql_expr(
             )
         left = _eval_gql_expr(expr.left, graph, context, row)
         if expr.op == "IN" and isinstance(expr.right, FunctionCall):
-            right = [
-                _eval_gql_expr(item, graph, context, row) for item in expr.right.args
-            ]
+            right = [_eval_gql_expr(item, graph, context, row) for item in expr.right.args]
         else:
             right = _eval_gql_expr(expr.right, graph, context, row)
         return _compare(left, expr.op, right)
@@ -384,16 +420,24 @@ def _eval_gql_expr(
         if name == "LIST":
             return values
         if name in {"ID", "ELEMENT_ID"}:
-            return values[0].id if len(values) == 1 and isinstance(values[0], (Node, Edge)) else None
+            return (
+                values[0].id if len(values) == 1 and isinstance(values[0], (Node, Edge)) else None
+            )
         if name == "COALESCE":
             return next((value for value in values if value is not None), None)
         if name == "PARAM":
             if len(values) != 1 or not isinstance(values[0], str):
                 raise CatalogError("PARAM expects one string argument")
-            return context.parameters.get(values[0])
+            return parameter(context.parameters, values[0])
         if name == "HAS_ROLE":
-            return len(values) == 1 and str(values[0]) in context.roles
+            if len(values) != 1 or not isinstance(values[0], str):
+                raise CatalogError("HAS_ROLE expects a string")
+            return values[0] in context.roles
         if name == "PROPERTY_EXISTS":
+            if len(values) != 2 or not isinstance(values[1], str):
+                raise CatalogError("PROPERTY_EXISTS expects an element and a string")
+            if values[0] is not None and not isinstance(values[0], (Node, Edge)):
+                raise CatalogError("PROPERTY_EXISTS expects an element and a string")
             return (
                 len(values) == 2
                 and isinstance(values[0], (Node, Edge))
@@ -417,12 +461,49 @@ def _eval_gql_expr(
 def compile_gql_predicate(text: str) -> Predicate:
     """Compile the side-effect-free GQL expression subset used by policies."""
 
+    if len(text) > 8192:
+        raise CatalogError("Policy source exceeds 8192 characters")
     try:
         expression = parse_expression(text.strip())
     except Exception as exc:
         raise CatalogError(f"Invalid GQL policy predicate: {exc}") from exc
 
-    for item in walk_expr(expression):
+    nodes = list(walk_expr(expression))
+    try:
+        require(
+            expression_type(
+                expression, {"RESOURCE": "ELEMENT", "NEW_RESOURCE": "ELEMENT"}, policy=True
+            ),
+            {"BOOL"},
+        )
+    except Exception as exc:
+        raise CatalogError("Invalid policy names, types or function arguments") from exc
+    if len(nodes) > 256:
+        raise CatalogError("Policy expression exceeds 256 AST nodes")
+    # Bounding total EXISTS nodes also bounds their nesting depth.
+    if sum(isinstance(n, ExistsExpr) for n in nodes) > 4:
+        raise CatalogError("Policy expression exceeds four EXISTS subqueries")
+    allowed_nodes = (
+        Literal,
+        VariableRef,
+        PropertyRef,
+        LabelTest,
+        UnaryExpr,
+        BinaryExpr,
+        FunctionCall,
+        ExistsExpr,
+    )
+    for item in nodes:
+        if not isinstance(item, allowed_nodes):
+            raise CatalogError("Policy AST node is not admissible")
+        if isinstance(item, FunctionCall) and item.name.upper() not in {
+            "LIST",
+            "COALESCE",
+            "PARAM",
+            "HAS_ROLE",
+            "PROPERTY_EXISTS",
+        }:
+            raise CatalogError("Policy function is not admissible")
         if not isinstance(item, ExistsExpr):
             continue
         query = item.query
@@ -437,13 +518,11 @@ def compile_gql_predicate(text: str) -> Predicate:
                 for keyword, _content in scan_clauses(query.source)
             )
         ):
-            raise CatalogError(
-                "Policy EXISTS supports only MATCH clauses with an optional WHERE"
-            )
+            raise CatalogError("Policy EXISTS supports only MATCH clauses with an optional WHERE")
+        if sum(len(c.pattern.nodes) + len(c.pattern.edges) for c in query.matches) > 64:
+            raise CatalogError("Policy EXISTS exceeds 64 pattern constituents")
 
-    def predicate(
-        graph: PropertyGraph, context: PolicyEvaluationContext
-    ) -> TruthValue:
+    def predicate(graph: PropertyGraph, context: PolicyEvaluationContext) -> TruthValue:
         bindings = {
             "RESOURCE": context.resource,
             "NEW_RESOURCE": context.new_resource,
@@ -453,7 +532,7 @@ def compile_gql_predicate(text: str) -> Predicate:
     return predicate
 
 
-def compile_predicate(spec: Any) -> Predicate:
+def compile_predicate(spec: Any, _depth: int = 0) -> Predicate:
     """Compile the JSON policy predicate language into a pure callable.
 
     The prototype intentionally uses a small, deterministic JSON AST instead of
@@ -461,6 +540,10 @@ def compile_predicate(spec: Any) -> Predicate:
     property comparisons, context parameters, and bounded relationship tests.
     """
 
+    if _depth > 16:
+        raise CatalogError("JSON policy exceeds 16 levels")
+    if isinstance(spec, dict) and len(str(spec)) > 8192:
+        raise CatalogError("JSON policy exceeds source budget")
     if spec is None or spec is True:
         return lambda graph, context: True
     if spec is False:
@@ -469,13 +552,15 @@ def compile_predicate(spec: Any) -> Predicate:
         return compile_gql_predicate(spec)
     if not isinstance(spec, dict):
         raise CatalogError(f"Policy predicate must be a JSON object or Boolean, got {spec!r}")
+    if len(spec) != 1:
+        raise CatalogError("A JSON predicate must contain exactly one operator")
 
     if "all" in spec:
-        compiled_all = [compile_predicate(item) for item in spec["all"]]
+        if not isinstance(spec["all"], list):
+            raise CatalogError("JSON all requires a list of predicates")
+        compiled_all = [compile_predicate(item, _depth + 1) for item in spec["all"]]
 
-        def all_predicates(
-            graph: PropertyGraph, context: PolicyEvaluationContext
-        ) -> TruthValue:
+        def all_predicates(graph: PropertyGraph, context: PolicyEvaluationContext) -> TruthValue:
             result: TruthValue = True
             for predicate in compiled_all:
                 result = _truth_and(result, predicate(graph, context))
@@ -483,11 +568,11 @@ def compile_predicate(spec: Any) -> Predicate:
 
         return all_predicates
     if "any" in spec:
-        compiled_any = [compile_predicate(item) for item in spec["any"]]
+        if not isinstance(spec["any"], list):
+            raise CatalogError("JSON any requires a list of predicates")
+        compiled_any = [compile_predicate(item, _depth + 1) for item in spec["any"]]
 
-        def any_predicates(
-            graph: PropertyGraph, context: PolicyEvaluationContext
-        ) -> TruthValue:
+        def any_predicates(graph: PropertyGraph, context: PolicyEvaluationContext) -> TruthValue:
             result: TruthValue = False
             for predicate in compiled_any:
                 result = _truth_or(result, predicate(graph, context))
@@ -495,17 +580,23 @@ def compile_predicate(spec: Any) -> Predicate:
 
         return any_predicates
     if "not" in spec:
-        compiled_not = compile_predicate(spec["not"])
+        compiled_not = compile_predicate(spec["not"], _depth + 1)
         return lambda graph, context: _truth_not(compiled_not(graph, context))
     if "resource_label" in spec:
         label = str(spec["resource_label"])
-        return lambda graph, context: isinstance(context.resource, Node) and label in context.resource.labels
+        return lambda graph, context: (
+            isinstance(context.resource, Node) and label in context.resource.labels
+        )
     if "new_resource_label" in spec:
         label = str(spec["new_resource_label"])
-        return lambda graph, context: isinstance(context.new_resource, Node) and label in context.new_resource.labels
+        return lambda graph, context: (
+            isinstance(context.new_resource, Node) and label in context.new_resource.labels
+        )
     if "resource_type" in spec:
         edge_type = str(spec["resource_type"])
-        return lambda graph, context: isinstance(context.resource, Edge) and context.resource.type == edge_type
+        return lambda graph, context: (
+            isinstance(context.resource, Edge) and edge_type in context.resource.labels
+        )
     if "property_compare" in spec:
         item = spec["property_compare"]
         source_name = str(item.get("source", "RESOURCE"))
@@ -513,9 +604,7 @@ def compile_predicate(spec: Any) -> Predicate:
         op = str(item.get("op", "="))
         expected = item.get("value")
 
-        def property_compare(
-            graph: PropertyGraph, context: PolicyEvaluationContext
-        ) -> TruthValue:
+        def property_compare(graph: PropertyGraph, context: PolicyEvaluationContext) -> TruthValue:
             source = _source(context, source_name)
             if not isinstance(source, (Node, Edge)):
                 return None
@@ -523,7 +612,7 @@ def compile_predicate(spec: Any) -> Predicate:
             if expected == "SESSION_USER":
                 right = context.user
             elif isinstance(expected, str) and expected.startswith("PARAM:"):
-                right = context.parameters.get(expected.split(":", 1)[1])
+                right = parameter(context.parameters, expected.split(":", 1)[1])
             return _compare(source.properties.get(property_name), op, right)
 
         return property_compare
@@ -532,9 +621,11 @@ def compile_predicate(spec: Any) -> Predicate:
         name = str(item["name"])
         op = str(item.get("op", "="))
         expected = item.get("value")
-        return lambda graph, context: _compare(context.parameters.get(name), op, expected)
+        return lambda graph, context: _compare(parameter(context.parameters, name), op, expected)
     if "path_exists" in spec:
         path_spec = spec["path_exists"]
+        if len(path_spec.get("steps", [])) > 12:
+            raise CatalogError("JSON policy path exceeds 12 steps")
         return lambda graph, context: _path_exists(graph, path_spec, context)
 
     raise CatalogError(f"Unsupported policy predicate form: {spec}")

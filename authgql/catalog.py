@@ -77,7 +77,7 @@ class Target:
             )
         if self.kind == "EDGES":
             return isinstance(resource, Edge) and (
-                not self.edge_types or resource.type in self.edge_types
+                not self.edge_types or bool(resource.labels.intersection(self.edge_types))
             )
         if self.kind == "PROPERTIES":
             if property_name is None:
@@ -91,29 +91,35 @@ class Target:
             if isinstance(resource, Edge):
                 if self.labels:
                     return False
-                return not self.edge_types or resource.type in self.edge_types
+                return not self.edge_types or bool(resource.labels.intersection(self.edge_types))
             return False
         return False
 
-    def covers_target(self, required: "Target") -> bool:
+    def covers_target(self, required: "Target", *, conjunctive: bool = False) -> bool:
+        """Contain a union-valued grant target, or a conjunctive pattern scope.
+
+        Static query scopes use conjunctive=True; delegation also uses it to
+        detect a denial of a named constituent. Delegation permits and revocation
+        support must contain the entire requested union of label classes.
+        """
         if self.graph != "*" and self.graph != required.graph:
             return False
         if self.kind == "GRAPH":
             return True
 
         def covers_classes(granted: frozenset[str], needed: frozenset[str]) -> bool:
-            # Label/type target sets denote a union of element classes.  A
-            # pattern requiring A:B is contained in a grant for A because every
-            # matching element belongs to the A class.  An empty granted class
-            # denotes all classes, whereas an empty required class is unbounded.
-            return not granted or bool(granted.intersection(needed))
+            return (
+                not granted
+                or bool(needed)
+                and (
+                    bool(granted.intersection(needed)) if conjunctive else needed.issubset(granted)
+                )
+            )
 
-        def covers_properties(
-            granted: frozenset[str], needed: frozenset[str]
-        ) -> bool:
+        def covers_properties(granted: frozenset[str], needed: frozenset[str]) -> bool:
             # Property keys are not alternatives: every statically required key
             # must be present in the grant (an empty grant denotes all keys).
-            return not granted or needed.issubset(granted)
+            return not granted or bool(needed) and needed.issubset(granted)
 
         if self.kind == "NODES":
             if required.kind not in {"NODES", "PROPERTIES"} or required.edge_types:
@@ -195,6 +201,13 @@ class PolicyDescriptor:
     owner: str = "system"
     enabled: bool = True
     grantee_kinds: dict[str, str] = field(default_factory=dict)
+    # Canonical tagged identities; None imports the legacy two-field form.
+    principals: set[tuple[str, str]] | None = None
+
+    def principal_keys(self) -> set[tuple[str, str]]:
+        if self.principals is not None:
+            return self.principals
+        return {(self.grantee_kinds.get(name, "AUTO"), name) for name in self.grantees}
 
     @classmethod
     def from_dict(
@@ -204,8 +217,7 @@ class PolicyDescriptor:
     ) -> "PolicyDescriptor":
         grantees = set(map(str, raw.get("grantees", [])))
         raw_kinds = {
-            str(name): str(kind).upper()
-            for name, kind in raw.get("grantee_kinds", {}).items()
+            str(name): str(kind).upper() for name, kind in raw.get("grantee_kinds", {}).items()
         }
         known_roles = set(role_names)
         return cls(
@@ -220,10 +232,11 @@ class PolicyDescriptor:
             dependencies=set(map(str, raw.get("dependencies", []))),
             owner=str(raw.get("owner", "system")),
             enabled=bool(raw.get("enabled", True)),
+            principals={(str(p["kind"]).upper(), str(p["name"])) for p in raw["principals"]}
+            if "principals" in raw
+            else None,
             grantee_kinds={
-                grantee: raw_kinds.get(
-                    grantee, "ROLE" if grantee in known_roles else "USER"
-                )
+                grantee: raw_kinds.get(grantee, "ROLE" if grantee in known_roles else "USER")
                 for grantee in grantees
             },
         )
@@ -234,6 +247,9 @@ class PolicyDescriptor:
             "graph": self.graph,
             "actions": sorted(self.actions),
             "grantees": sorted(self.grantees),
+            "principals": [
+                {"kind": kind, "name": name} for kind, name in sorted(self.principal_keys())
+            ],
             "grantee_kinds": {
                 grantee: self.grantee_kinds.get(grantee, "AUTO")
                 for grantee in sorted(self.grantees)
@@ -257,7 +273,9 @@ class PolicyDescriptor:
         if labels and (not isinstance(resource, Node) or not labels.intersection(resource.labels)):
             return False
         edge_types = set(map(str, self.selector.get("edge_types", self.selector.get("types", []))))
-        if edge_types and (not isinstance(resource, Edge) or resource.type not in edge_types):
+        if edge_types and (
+            not isinstance(resource, Edge) or not resource.labels.intersection(edge_types)
+        ):
             return False
         return True
 
@@ -291,13 +309,9 @@ class AuthorizationCatalog:
                 for user, assigned in data.get("user_roles", {}).items()
             },
             privileges=[
-                PrivilegeFact.from_dict(item, roles)
-                for item in data.get("privileges", [])
+                PrivilegeFact.from_dict(item, roles) for item in data.get("privileges", [])
             ],
-            policies=[
-                PolicyDescriptor.from_dict(item, roles)
-                for item in data.get("policies", [])
-            ],
+            policies=[PolicyDescriptor.from_dict(item, roles) for item in data.get("policies", [])],
             metadata=copy.deepcopy(data.get("metadata", {})),
             revision=int(data.get("revision", 0)),
         )
@@ -314,9 +328,7 @@ class AuthorizationCatalog:
         for fact in self.privileges:
             row = fact.to_dict()
             if row["grantee_kind"] == "AUTO":
-                row["grantee_kind"] = (
-                    "ROLE" if fact.grantee in self.roles else "USER"
-                )
+                row["grantee_kind"] = "ROLE" if fact.grantee in self.roles else "USER"
             privilege_rows.append(row)
 
         policy_rows: list[dict[str, Any]] = []
@@ -334,9 +346,7 @@ class AuthorizationCatalog:
             "roles": {
                 role: {"inherits": sorted(parents)} for role, parents in sorted(self.roles.items())
             },
-            "user_roles": {
-                user: sorted(roles) for user, roles in sorted(self.user_roles.items())
-            },
+            "user_roles": {user: sorted(roles) for user, roles in sorted(self.user_roles.items())},
             "privileges": privilege_rows,
             "policies": policy_rows,
             "metadata": copy.deepcopy(self.metadata),
@@ -410,28 +420,24 @@ class AuthorizationCatalog:
             unsupported_actions = policy.actions.difference(POLICY_ACTIONS)
             if unsupported_actions:
                 raise CatalogError(
-                    f"Unsupported policy actions on {policy.name!r}: "
-                    f"{sorted(unsupported_actions)}"
+                    f"Unsupported policy actions on {policy.name!r}: {sorted(unsupported_actions)}"
                 )
-            if not policy.grantees:
-                raise CatalogError(f"Policy {policy.name!r} must contain at least one grantee")
-            for grantee in policy.grantees:
-                kind = policy.grantee_kinds.get(
-                    grantee, "ROLE" if grantee in self.roles else "USER"
-                ).upper()
-                policy.grantee_kinds[grantee] = kind
+            keys = policy.principal_keys()
+            # Empty retained descriptors still close an enabled action/selector
+            # scope. Creation requires grantees, but role CASCADE may remove the
+            # last one; catalog import/snapshots must preserve that state.
+            normalized = set()
+            for kind, grantee in keys:
+                if kind == "AUTO":
+                    kind = "ROLE" if grantee in self.roles else "USER"
+                normalized.add((kind, grantee))
                 if kind not in {"USER", "ROLE"}:
-                    raise CatalogError(
-                        f"Invalid policy grantee kind on {policy.name!r}: {kind!r}"
-                    )
+                    raise CatalogError(f"Invalid policy grantee kind on {policy.name!r}: {kind!r}")
                 if kind == "ROLE" and grantee not in self.roles:
-                    raise CatalogError(
-                        f"Policy {policy.name!r} names unknown role {grantee!r}"
-                    )
-            policy.grantee_kinds = {
-                grantee: policy.grantee_kinds[grantee]
-                for grantee in policy.grantees
-            }
+                    raise CatalogError(f"Policy {policy.name!r} names unknown role {grantee!r}")
+            policy.principals = normalized
+            policy.grantees = {name for _, name in normalized}
+            policy.grantee_kinds = {name: kind for kind, name in sorted(normalized)}
         for user, roles in self.user_roles.items():
             missing = roles.difference(self.roles)
             if missing:
@@ -529,14 +535,16 @@ class AuthorizationCatalog:
             return False
         return any(fact.effect == "PERMIT" for fact in facts)
 
-    def object_target_permitted(self, user: str, action: str, target: Target) -> bool:
+    def object_target_permitted(
+        self, user: str, action: str, target: Target, *, conjunctive: bool = False
+    ) -> bool:
         principals = self.principal_keys_for(user)
         facts = [
             fact
             for fact in self.privileges
             if (fact.grantee_kind, fact.grantee) in principals
             and any(action_implies(granted, action) for granted in fact.actions)
-            and fact.target.covers_target(target)
+            and fact.target.covers_target(target, conjunctive=conjunctive)
         ]
         if any(fact.effect == "DENY" for fact in facts):
             return False
@@ -555,7 +563,9 @@ class AuthorizationCatalog:
             for fact in self.privileges
             if (fact.grantee_kind, fact.grantee) in effective_principals
             and any(action_implies(granted, action) for granted in fact.actions)
-            and fact.target.covers_target(target)
+            # A permit must cover the entire union. A denial of a named
+            # constituent must not disappear when that union is widened.
+            and fact.target.covers_target(target, conjunctive=fact.effect == "DENY")
         ]
         if self.object_target_permitted(user, "ADMINISTER", target):
             return True
@@ -582,15 +592,71 @@ class AuthorizationCatalog:
             for policy in self.policies
             if policy.enabled
             and policy.graph == graph_name
-            and any(
-                (policy.grantee_kinds[grantee], grantee) in principals
-                for grantee in policy.grantees
-            )
+            and bool(policy.principal_keys().intersection(principals))
             and policy_action_matches(policy.actions, action)
             and policy.selector_matches(resource)
         ]
 
     # ---------- Transaction-friendly administration ----------
+
+    def scope_policies(
+        self, action: str, graph_name: str, resource: GraphElement
+    ) -> list[PolicyDescriptor]:
+        """Enabled action/selector scope, independent of requester grantees."""
+        return [
+            p
+            for p in self.policies
+            if p.enabled
+            and p.graph == graph_name
+            and policy_action_matches(p.actions, action)
+            and p.selector_matches(resource)
+        ]
+
+    def policy_reference_valid(
+        self,
+        policy: PolicyDescriptor,
+        graph_names: set[str],
+        visiting: set[str] | None = None,
+        *,
+        descriptors: "AuthorizationCatalog | None" = None,
+    ) -> bool:
+        """Validate owner authority and transitive lifecycle dependencies.
+
+        The target graph is mandatory even for imported descriptors. This
+        single-current-graph profile rejects unknown and cross-graph objects.
+        Call against an immutable authorization snapshot for data execution.
+        """
+        visiting = set(visiting or ())
+        if policy.name in visiting:
+            return False
+        visiting.add(policy.name)
+        for dependency in {f"graph:{policy.graph}", *policy.dependencies}:
+            kind, separator, name = dependency.partition(":")
+            if not separator:
+                return False
+            if kind == "graph":
+                if (
+                    name != policy.graph
+                    or name not in graph_names
+                    or not self.object_target_permitted(
+                        policy.owner, "POLICY REFERENCE", Target("GRAPH", name)
+                    )
+                ):
+                    return False
+            elif kind == "policy":
+                catalog = descriptors if descriptors is not None else self
+                target = next((p for p in catalog.policies if p.name == name), None)
+                if (
+                    target is None
+                    or target.graph != policy.graph
+                    or not self.policy_reference_valid(
+                        target, graph_names, visiting, descriptors=descriptors
+                    )
+                ):
+                    return False
+            else:
+                return False
+        return True
 
     def create_role(self, name: str) -> None:
         if name in self.roles:
@@ -758,9 +824,7 @@ class AuthorizationCatalog:
                 effect=fact.effect,
                 actions=frozenset(fact_actions),
                 target=fact.target,
-                grant_option=(
-                    fact.grant_option if grant_option is None else grant_option
-                ),
+                grant_option=(fact.grant_option if grant_option is None else grant_option),
                 grantor=fact.grantor,
                 grantee_kind=fact.grantee_kind,
             )
@@ -771,9 +835,7 @@ class AuthorizationCatalog:
             fact_id = id(fact)
             if fact_id not in selected_ids:
                 removed_actions = (
-                    dependent_actions.get(fact_id, set())
-                    if behavior == "CASCADE"
-                    else set()
+                    dependent_actions.get(fact_id, set()) if behavior == "CASCADE" else set()
                 )
                 if not removed_actions:
                     rebuilt.append(fact)
@@ -802,6 +864,8 @@ class AuthorizationCatalog:
     def add_policy(self, policy: PolicyDescriptor) -> None:
         if any(existing.name == policy.name for existing in self.policies):
             raise CatalogError(f"Policy already exists: {policy.name!r}")
+        if not policy.principal_keys():
+            raise CatalogError("A new policy must contain at least one grantee")
         self.policies.append(policy)
         try:
             self.validate()
@@ -825,14 +889,10 @@ class AuthorizationCatalog:
         if name not in policies:
             raise CatalogError(f"Unknown policy: {name!r}")
         dependents = {
-            policy.name
-            for policy in self.policies
-            if f"policy:{name}" in policy.dependencies
+            policy.name for policy in self.policies if f"policy:{name}" in policy.dependencies
         }
         if dependents and behavior == "RESTRICT":
-            raise CatalogError(
-                f"RESTRICT rejected drop; dependent policies: {sorted(dependents)}"
-            )
+            raise CatalogError(f"RESTRICT rejected drop; dependent policies: {sorted(dependents)}")
         removed = {name}
         if behavior == "CASCADE":
             while True:
@@ -855,17 +915,17 @@ class AuthorizationCatalog:
         dependent_roles = {role for role, parents in self.roles.items() if name in parents}
         dependent_users = {user for user, roles in self.user_roles.items() if name in roles}
         dependent_privileges = [
-            fact
-            for fact in self.privileges
-            if fact.grantee_kind == "ROLE" and fact.grantee == name
+            fact for fact in self.privileges if fact.grantee_kind == "ROLE" and fact.grantee == name
         ]
         dependent_policies = [
-            policy
-            for policy in self.policies
-            if name in policy.grantees and policy.grantee_kinds.get(name) == "ROLE"
+            policy for policy in self.policies if ("ROLE", name) in policy.principal_keys()
         ]
         if behavior == "RESTRICT" and (
-            dependent_roles or dependent_users or dependent_privileges or dependent_policies
+            self.roles[name]
+            or dependent_roles
+            or dependent_users
+            or dependent_privileges
+            or dependent_policies
         ):
             raise CatalogError(f"RESTRICT rejected drop of role {name!r}; dependencies exist")
         if behavior not in {"RESTRICT", "CASCADE"}:
@@ -880,9 +940,11 @@ class AuthorizationCatalog:
             if not (fact.grantee_kind == "ROLE" and fact.grantee == name)
         ]
         for policy in dependent_policies:
-            policy.grantees.discard(name)
-            policy.grantee_kinds.pop(name, None)
-        self.policies = [policy for policy in self.policies if policy.grantees]
+            policy.principals = policy.principal_keys() - {("ROLE", name)}
+            policy.grantees = {grantee for _, grantee in policy.principals}
+            policy.grantee_kinds = {grantee: kind for kind, grantee in sorted(policy.principals)}
+        # Never reopen a protected scope merely because its last grantee was
+        # removed. Explicit DROP/DISABLE POLICY remains a separate operation.
         del self.roles[name]
         self.touch()
 
@@ -892,19 +954,24 @@ class AuthorizationCatalog:
         effective = self.effective_roles(user)
         privilege_principals = self.principal_keys_for(user)
         policy_principals = self.principal_keys_for(user)
-        privileges = self.privileges if full else [
-            fact
-            for fact in self.privileges
-            if (fact.grantee_kind, fact.grantee) in privilege_principals
-        ]
-        policies = self.policies if full else [
-            policy
-            for policy in self.policies
-            if any(
-                (policy.grantee_kinds[grantee], grantee) in policy_principals
-                for grantee in policy.grantees
-            )
-        ]
+        privileges = (
+            self.privileges
+            if full
+            else [
+                fact
+                for fact in self.privileges
+                if (fact.grantee_kind, fact.grantee) in privilege_principals
+            ]
+        )
+        policies = (
+            self.policies
+            if full
+            else [
+                policy
+                for policy in self.policies
+                if policy.principal_keys().intersection(policy_principals)
+            ]
+        )
         return {
             "AUTHORIZATION_ROLES": [
                 {"role": role, "inherits": sorted(parents)}
@@ -934,7 +1001,9 @@ class AuthorizationCatalog:
                 {"policy": policy.name, "dependency": dependency}
                 for policy in policies
                 for dependency in sorted(policy.dependencies)
-            ] if full else [],
+            ]
+            if full
+            else [],
             "effective_user": user,
             "effective_roles": sorted(effective),
             "catalog_revision": self.revision,

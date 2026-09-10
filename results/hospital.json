@@ -1,0 +1,115 @@
+{
+  "scenario": "hospital",
+  "authorization_identifier": "alice except where stated",
+  "cases": [
+    {
+      "name": "guarded_fixed_path",
+      "status": "ok",
+      "rows": [
+        {
+          "age": 42,
+          "diagnosis": "D-A"
+        }
+      ],
+      "row_count": 1,
+      "reference_equal": true,
+      "metrics": {
+        "object_checks": 13,
+        "policy_evaluations": 10,
+        "property_checks": 2,
+        "node_scan_candidates": 9,
+        "edge_candidates": 4,
+        "denied_before_enqueue": 2,
+        "nodes_enqueued": 3,
+        "edges_enqueued": 2,
+        "bindings_materialized": 2,
+        "update_candidates": 0,
+        "with_check_evaluations": 0
+      }
+    },
+    {
+      "name": "hidden_exists",
+      "status": "ok",
+      "rows": [],
+      "row_count": 0,
+      "reference_equal": true,
+      "metrics": {
+        "object_checks": 11,
+        "policy_evaluations": 6,
+        "property_checks": 2,
+        "node_scan_candidates": 18,
+        "edge_candidates": 2,
+        "denied_before_enqueue": 2,
+        "nodes_enqueued": 3,
+        "edges_enqueued": 1,
+        "bindings_materialized": 0,
+        "update_candidates": 0,
+        "with_check_evaluations": 0
+      }
+    },
+    {
+      "name": "authorized_aggregate",
+      "status": "ok",
+      "rows": [
+        {
+          "patients": 1
+        }
+      ],
+      "row_count": 1,
+      "reference_equal": true,
+      "metrics": {
+        "object_checks": 4,
+        "policy_evaluations": 6,
+        "property_checks": 0,
+        "node_scan_candidates": 9,
+        "edge_candidates": 0,
+        "denied_before_enqueue": 2,
+        "nodes_enqueued": 1,
+        "edges_enqueued": 0,
+        "bindings_materialized": 0,
+        "update_candidates": 0,
+        "with_check_evaluations": 0
+      }
+    },
+    {
+      "name": "guarded_quantified_path",
+      "status": "ok",
+      "rows": [
+        {
+          "diagnosis": "D-A"
+        }
+      ],
+      "row_count": 1,
+      "reference_equal": true,
+      "metrics": {
+        "object_checks": 8,
+        "policy_evaluations": 6,
+        "property_checks": 1,
+        "node_scan_candidates": 9,
+        "edge_candidates": 2,
+        "denied_before_enqueue": 2,
+        "nodes_enqueued": 2,
+        "edges_enqueued": 1,
+        "bindings_materialized": 1,
+        "update_candidates": 0,
+        "with_check_evaluations": 0
+      }
+    },
+    {
+      "name": "protected_property",
+      "status": "denied",
+      "code": "42000"
+    },
+    {
+      "name": "with_check_rejection",
+      "status": "denied",
+      "code": "42000",
+      "graph_unchanged": true
+    }
+  ],
+  "summary": {
+    "case_count": 6,
+    "all_read_cases_equal_reference": true,
+    "denied_before_enqueue": 8
+  }
+}

@@ -10,6 +10,12 @@
   },
   "privileges": [
     {
+      "grantee": "security_admin",
+      "grantee_kind": "USER",
+      "actions": ["POLICY REFERENCE"],
+      "target": {"kind": "GRAPH", "graph": "hospital"}
+    },
+    {
       "grantee": "clinician",
       "grantee_kind": "ROLE",
       "effect": "PERMIT",

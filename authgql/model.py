@@ -23,23 +23,66 @@ class Node:
         return Node(self.id, set(self.labels), copy.deepcopy(self.properties))
 
 
-@dataclass
+@dataclass(init=False)
 class Edge:
     id: str
     type: str
     source: str
     target: str
     properties: dict[str, Any] = field(default_factory=dict)
+    labels: set[str] = field(default_factory=set)
+    directed: bool = True
+
+    def __init__(
+        self,
+        id: str,
+        type: str,
+        source: str,
+        target: str,
+        properties: dict[str, Any] | None = None,
+        labels: set[str] | None = None,
+        directed: bool = True,
+    ) -> None:
+        self.id, self.type, self.source, self.target = id, type, source, target
+        self.properties = {} if properties is None else properties
+        # `type` remains a legacy input alias, never the authorization label set.
+        self.labels = {self.type} if labels is None else set(labels)
+        self.directed = directed
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if type(self.directed) is not bool:
+            raise ExecutionError("Edge directed flag must be Boolean", code="22000")
 
     @property
     def kind(self) -> str:
         return "EDGE"
 
     def clone(self) -> "Edge":
-        return Edge(self.id, self.type, self.source, self.target, copy.deepcopy(self.properties))
+        return Edge(
+            self.id,
+            self.type,
+            self.source,
+            self.target,
+            copy.deepcopy(self.properties),
+            set(self.labels),
+            self.directed,
+        )
 
 
 GraphElement = Node | Edge
+
+
+def element_key(element: GraphElement) -> tuple[str, str]:
+    return element.kind, element.id
+
+
+@dataclass(frozen=True)
+class PathValue:
+    """An admitted path contains identities only, never property maps."""
+
+    nodes: tuple[str, ...]
+    edges: tuple[str, ...]
 
 
 @dataclass
@@ -81,10 +124,12 @@ class PropertyGraph:
         for raw in data.get("edges", []):
             edge = Edge(
                 id=str(raw["id"]),
-                type=str(raw["type"]),
+                type=str(raw.get("type", next(iter(raw.get("labels", [])), ""))),
                 source=str(raw["source"]),
                 target=str(raw["target"]),
                 properties=copy.deepcopy(raw.get("properties", {})),
+                labels=set(map(str, raw["labels"])) if "labels" in raw else None,
+                directed=raw.get("directed", True),
             )
             if edge.id in edges:
                 raise ExecutionError(f"Duplicate edge id: {edge.id}", code="23000")
@@ -111,6 +156,8 @@ class PropertyGraph:
                 {
                     "id": edge.id,
                     "type": edge.type,
+                    "labels": sorted(edge.labels),
+                    "directed": edge.directed,
                     "source": edge.source,
                     "target": edge.target,
                     "properties": copy.deepcopy(edge.properties),
@@ -138,7 +185,17 @@ class PropertyGraph:
         self.edges = {edge_id: edge.clone() for edge_id, edge in other.edges.items()}
         self.rebuild_indexes()
 
-    def element(self, element_id: str) -> GraphElement:
+    def element(self, element_id: str | tuple[str, str]) -> GraphElement:
+        if isinstance(element_id, tuple):
+            kind, identifier = element_id
+            if kind not in {"NODE", "EDGE"}:
+                raise ExecutionError("Invalid element kind", code="22000")
+            elements = self.nodes if kind == "NODE" else self.edges
+            if identifier in elements:
+                return elements[identifier]
+            raise ExecutionError(f"Unknown {kind.lower()} identity")
+        if element_id in self.nodes and element_id in self.edges:
+            raise ExecutionError("Ambiguous element identity: supply its kind", code="22000")
         if element_id in self.nodes:
             return self.nodes[element_id]
         if element_id in self.edges:
@@ -154,12 +211,24 @@ class PropertyGraph:
             yield self.edges[edge_id]
 
     def adjacent(self, node_id: str, direction: str = "out") -> Iterator[tuple[Edge, Node]]:
-        if direction in {"out", "both"}:
+        if direction not in {"out", "in", "both", "undirected"}:
+            raise ExecutionError("Unsupported edge direction", code="22000")
+        seen = set()
+        if direction in {"out", "both", "undirected"}:
             for edge in self.out_edges(node_id):
-                yield edge, self.nodes[edge.target]
-        if direction in {"in", "both"}:
+                if (edge.directed and direction != "undirected") or (
+                    not edge.directed and direction in {"both", "undirected"}
+                ):
+                    seen.add(edge.id)
+                    yield edge, self.nodes[edge.target]
+        if direction in {"in", "both", "undirected"}:
             for edge in self.in_edges(node_id):
-                yield edge, self.nodes[edge.source]
+                if edge.id in seen:
+                    continue  # A self-loop supplies one step, not two copies.
+                if (edge.directed and direction != "undirected") or (
+                    not edge.directed and direction in {"both", "undirected"}
+                ):
+                    yield edge, self.nodes[edge.source]
 
     def matching_nodes(
         self,
@@ -175,14 +244,14 @@ class PropertyGraph:
                 yield node
 
     def add_node(self, node: Node) -> None:
-        if node.id in self.nodes or node.id in self.edges:
+        if node.id in self.nodes:
             raise ExecutionError(f"Duplicate graph element id: {node.id}", code="23000")
         self.nodes[node.id] = node
         self._out[node.id] = []
         self._in[node.id] = []
 
     def add_edge(self, edge: Edge) -> None:
-        if edge.id in self.nodes or edge.id in self.edges:
+        if edge.id in self.edges:
             raise ExecutionError(f"Duplicate graph element id: {edge.id}", code="23000")
         if edge.source not in self.nodes or edge.target not in self.nodes:
             raise ExecutionError("Inserted edge has a missing endpoint", code="G2000")

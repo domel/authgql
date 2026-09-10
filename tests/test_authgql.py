@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from authgql.analyzer import StaticAnalyzer
-from authgql.catalog import AuthorizationCatalog, PolicyDescriptor
+from authgql.catalog import AuthorizationCatalog, PolicyDescriptor, PrivilegeFact, Target
 from authgql.errors import AuthorizationError, CatalogError, ExecutionError
 from authgql.executor import SecureExecutor
 from authgql.model import PropertyGraph
@@ -20,6 +20,19 @@ from authgql.policy import PolicyEvaluationContext, compile_predicate
 
 
 EXAMPLES = ROOT / "examples"
+
+
+def grant_fixture_reference(catalog, graph="g"):
+    # Migrate legacy fixtures explicitly; policy ownership conveys no privilege.
+    catalog.add_privilege(
+        PrivilegeFact(
+            "system",
+            "PERMIT",
+            frozenset({"POLICY REFERENCE"}),
+            Target("GRAPH", graph),
+            grantee_kind="USER",
+        )
+    )
 
 
 class HospitalSecurityTests(unittest.TestCase):
@@ -46,8 +59,7 @@ class HospitalSecurityTests(unittest.TestCase):
     def test_researcher_cannot_dereference_identifying_property(self) -> None:
         with self.assertRaises(AuthorizationError) as raised:
             self.run_query(
-                "MATCH (p:Patient)-[:HAS_DIAGNOSIS]->(d:Diagnosis) "
-                "RETURN p.name AS name",
+                "MATCH (p:Patient)-[:HAS_DIAGNOSIS]->(d:Diagnosis) RETURN p.name AS name",
                 user="rita",
             )
         self.assertEqual(raised.exception.code, "42000")
@@ -127,11 +139,10 @@ class HospitalSecurityTests(unittest.TestCase):
                 ],
             }
         )
+        grant_fixture_reference(catalog)
         executor = SecureExecutor(graph, catalog, "u")
         with self.assertRaises(AuthorizationError):
-            executor.execute(
-                parse_query("MATCH (p:N) RETURN ID(p) AS id ORDER BY p.rank")
-            )
+            executor.execute(parse_query("MATCH (p:N) RETURN ID(p) AS id ORDER BY p.rank"))
         self.assertGreater(executor.metrics.policy_denials, 0)
 
         catalog.policies[0].using = "RESOURCE.secret"
@@ -144,17 +155,13 @@ class HospitalSecurityTests(unittest.TestCase):
 
     def test_with_check_rejects_and_rolls_back_set(self) -> None:
         update_policy = next(
-            policy
-            for policy in self.catalog.policies
-            if policy.name == "local_patient_update"
+            policy for policy in self.catalog.policies if policy.name == "local_patient_update"
         )
         update_policy.with_check = (
-            "RESOURCE.classification = 'normal' AND "
-            "NEW_RESOURCE.classification = 'restricted'"
+            "RESOURCE.classification = 'normal' AND NEW_RESOURCE.classification = 'restricted'"
         )
         result = self.run_query(
-            "MATCH (p:Patient) WHERE p.age = 42 "
-            "SET p.classification = 'restricted' FINISH"
+            "MATCH (p:Patient) WHERE p.age = 42 SET p.classification = 'restricted' FINISH"
         )
         self.assertTrue(result.updated)
         self.assertEqual(
@@ -163,14 +170,12 @@ class HospitalSecurityTests(unittest.TestCase):
         )
 
         update_policy.with_check = (
-            "RESOURCE.classification = 'restricted' AND "
-            "NEW_RESOURCE.classification <> 'sealed'"
+            "RESOURCE.classification = 'restricted' AND NEW_RESOURCE.classification <> 'sealed'"
         )
         before = self.graph.to_dict()
         with self.assertRaises(AuthorizationError) as raised:
             self.run_query(
-                "MATCH (p:Patient) WHERE p.age = 42 "
-                "SET p.classification = 'sealed' FINISH"
+                "MATCH (p:Patient) WHERE p.age = 42 SET p.classification = 'sealed' FINISH"
             )
         self.assertEqual(raised.exception.code, "42000")
         self.assertEqual(self.graph.to_dict(), before)
@@ -178,8 +183,7 @@ class HospitalSecurityTests(unittest.TestCase):
         update_policy.with_check = "NEW_RESOURCE.classification < 1"
         with self.assertRaises(AuthorizationError) as fault:
             self.run_query(
-                "MATCH (p:Patient) WHERE p.age = 42 "
-                "SET p.classification = 'normal' FINISH"
+                "MATCH (p:Patient) WHERE p.age = 42 SET p.classification = 'normal' FINISH"
             )
         self.assertEqual(fault.exception.code, "42000")
         self.assertEqual(self.graph.to_dict(), before)
@@ -189,6 +193,7 @@ class HospitalSecurityTests(unittest.TestCase):
         self.catalog.add_policy(
             PolicyDescriptor(
                 name="deny_post_update_projection",
+                owner="security_admin",
                 graph="hospital",
                 actions={"READ"},
                 grantees={"clinician"},
@@ -209,16 +214,11 @@ class HospitalSecurityTests(unittest.TestCase):
 
     def test_remove_uses_old_state_and_checks_new_state(self) -> None:
         update_policy = next(
-            policy
-            for policy in self.catalog.policies
-            if policy.name == "local_patient_update"
+            policy for policy in self.catalog.policies if policy.name == "local_patient_update"
         )
-        update_policy.with_check = (
-            "RESOURCE.address IS NOT NULL AND NEW_RESOURCE.address IS NULL"
-        )
+        update_policy.with_check = "RESOURCE.address IS NOT NULL AND NEW_RESOURCE.address IS NULL"
         result = self.run_query(
-            "MATCH (p:Patient) WHERE p.age = 42 "
-            "REMOVE p.address RETURN p.address AS address"
+            "MATCH (p:Patient) WHERE p.age = 42 REMOVE p.address RETURN p.address AS address"
         )
         self.assertEqual(result.rows, [{"address": None}])
         self.assertNotIn("address", self.graph.nodes["patient_visible"].properties)
@@ -227,10 +227,7 @@ class HospitalSecurityTests(unittest.TestCase):
         update_policy.with_check = "NEW_RESOURCE.classification <> 'sealed'"
         before = self.graph.to_dict()
         with self.assertRaises(AuthorizationError) as raised:
-            self.run_query(
-                "MATCH (p:Patient) WHERE p.age = 42 "
-                "REMOVE p.classification FINISH"
-            )
+            self.run_query("MATCH (p:Patient) WHERE p.age = 42 REMOVE p.classification FINISH")
         self.assertEqual(raised.exception.code, "42000")
         self.assertEqual(self.graph.to_dict(), before)
         self.assertEqual(
@@ -240,8 +237,7 @@ class HospitalSecurityTests(unittest.TestCase):
 
     def test_static_plan_contains_guards_and_property_obligations(self) -> None:
         query = parse_query(
-            "MATCH (u:User {login: SESSION_USER})-[:WORKS_AT]->(h:Hospital) "
-            "RETURN h.name AS name"
+            "MATCH (u:User {login: SESSION_USER})-[:WORKS_AT]->(h:Hospital) RETURN h.name AS name"
         )
         plan = StaticAnalyzer(self.catalog, "hospital", "alice").logical_plan(query)
         actions = {item["action"] for item in plan["obligations"]}
@@ -295,23 +291,20 @@ class PathConfinementTests(unittest.TestCase):
                         "effect": "DENY",
                         "selector": {"kind": "EDGE", "edge_types": ["BLOCKED"]},
                         "using": True,
-                    }
+                    },
                 ],
             }
         )
+        grant_fixture_reference(catalog)
         result = SecureExecutor(graph, catalog, "u").execute(
-            parse_query(
-                "MATCH (s:Start)-[:LINK*2..2]->(t:Goal) RETURN ID(t) AS target"
-            ),
+            parse_query("MATCH (s:Start)-[:LINK*2..2]->(t:Goal) RETURN ID(t) AS target"),
             compare_reference=True,
         )
         self.assertEqual(result.rows, [])
         self.assertTrue(result.reference_equal)
         self.assertGreater(result.metrics.denied_before_enqueue, 0)
         edge_result = SecureExecutor(graph, catalog, "u").execute(
-            parse_query(
-                "MATCH (s:Start)-[:BLOCKED]->(t:Goal) RETURN ID(t) AS target"
-            ),
+            parse_query("MATCH (s:Start)-[:BLOCKED]->(t:Goal) RETURN ID(t) AS target"),
             compare_reference=True,
         )
         self.assertEqual(edge_result.rows, [])
@@ -355,43 +348,38 @@ class UpdateAtomicityTests(unittest.TestCase):
         )
 
     def execute(self, source: str):
-        return SecureExecutor(self.graph, self.catalog, "w").execute(parse_query(source))
+        grant_fixture_reference(self.catalog)
+        identifiers = {"NODE": iter(["a", "b"]), "EDGE": iter(["e"])}
+        return SecureExecutor(
+            self.graph, self.catalog, "w", identity_factory=lambda kind: next(identifiers[kind])
+        ).execute(parse_query(source))
 
     def test_multi_element_insert_is_all_or_nothing(self) -> None:
         deny_policy = next(
-            policy
-            for policy in self.catalog.policies
-            if policy.name == "deny_bad_insert"
+            policy for policy in self.catalog.policies if policy.name == "deny_bad_insert"
         )
         deny_policy.with_check = "RESOURCE IS NULL AND NEW_RESOURCE:Denied"
         before = self.graph.to_dict()
         with self.assertRaises(AuthorizationError) as raised:
-            self.execute(
-                "INSERT (a:Allowed {_id:'a'}), (b:Denied {_id:'b'}) FINISH"
-            )
+            self.execute("INSERT (a:Allowed), (b:Denied) FINISH")
         self.assertEqual(raised.exception.code, "42000")
         self.assertEqual(self.graph.to_dict(), before)
 
         deny_policy.with_check = "RESOURCE.classification = 'blocked'"
         with self.assertRaises(AuthorizationError) as unknown_denial:
-            self.execute(
-                "INSERT (b:Denied {_id:'b', classification:'clear'}) FINISH"
-            )
+            self.execute("INSERT (b:Denied {classification:'clear'}) FINISH")
         self.assertEqual(unknown_denial.exception.code, "42000")
         self.assertEqual(self.graph.to_dict(), before)
 
     def test_inserted_edge_and_endpoints_commit_together(self) -> None:
-        result = self.execute(
-            "INSERT (a:A {_id:'a'})-[e:LINK {_id:'e'}]->(b:B {_id:'b'}) "
-            "RETURN ID(e) AS edge"
-        )
+        result = self.execute("INSERT (a:A)-[e:LINK]->(b:B) RETURN ID(e) AS edge")
         self.assertEqual(result.rows, [{"edge": "e"}])
         self.assertEqual(result.affected_elements, 3)
         self.assertEqual(self.graph.edges["e"].source, "a")
         self.assertEqual(self.graph.edges["e"].target, "b")
 
     def test_plain_delete_is_nodetach_and_detach_is_explicit(self) -> None:
-        self.execute("INSERT (a:A {_id:'a'})-[:LINK {_id:'e'}]->(b:B {_id:'b'}) FINISH")
+        self.execute("INSERT (a:A)-[:LINK]->(b:B) FINISH")
         before = self.graph.to_dict()
         with self.assertRaises(ExecutionError) as raised:
             self.execute("MATCH (a:A) DELETE a FINISH")
@@ -410,9 +398,7 @@ class UpdateAtomicityTests(unittest.TestCase):
                     {"id": "a", "labels": ["Protected"]},
                     {"id": "b", "labels": ["Other"]},
                 ],
-                "edges": [
-                    {"id": "e", "type": "LINK", "source": "a", "target": "b"}
-                ],
+                "edges": [{"id": "e", "type": "LINK", "source": "a", "target": "b"}],
             }
         )
         catalog = AuthorizationCatalog.from_dict(
@@ -439,6 +425,7 @@ class UpdateAtomicityTests(unittest.TestCase):
                 ],
             }
         )
+        grant_fixture_reference(catalog)
         with self.assertRaises(AuthorizationError) as raised:
             SecureExecutor(graph, catalog, "w").execute(
                 parse_query("MATCH (a:Protected) DELETE a FINISH")
@@ -475,42 +462,24 @@ class PolicyLanguageTests(unittest.TestCase):
         self.assertIsNone(compile_predicate("NULL = NULL")(graph, context))
         self.assertIsNone(compile_predicate("NULL <> NULL")(graph, context))
         self.assertFalse(compile_predicate("NULL IN ()")(graph, context))
+        self.assertIsNone(compile_predicate("NOT (RESOURCE.missing = 1)")(graph, context))
+        self.assertFalse(compile_predicate("(RESOURCE.missing = 1) AND FALSE")(graph, context))
+        self.assertIsNone(compile_predicate("(RESOURCE.missing = 1) AND TRUE")(graph, context))
+        self.assertTrue(compile_predicate("(RESOURCE.missing = 1) OR TRUE")(graph, context))
+        self.assertIsNone(compile_predicate("(RESOURCE.missing = 1) OR FALSE")(graph, context))
+        self.assertTrue(
+            compile_predicate("RESOURCE.classification IN ('normal', NULL)")(graph, context)
+        )
         self.assertIsNone(
-            compile_predicate("NOT (RESOURCE.missing = 1)")(graph, context)
+            compile_predicate("RESOURCE.classification IN ('sealed', NULL)")(graph, context)
         )
         self.assertFalse(
-            compile_predicate("(RESOURCE.missing = 1) AND FALSE")(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate("(RESOURCE.missing = 1) AND TRUE")(graph, context)
-        )
-        self.assertTrue(
-            compile_predicate("(RESOURCE.missing = 1) OR TRUE")(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate("(RESOURCE.missing = 1) OR FALSE")(graph, context)
-        )
-        self.assertTrue(
-            compile_predicate(
-                "RESOURCE.classification IN ('normal', NULL)"
-            )(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate(
-                "RESOURCE.classification IN ('sealed', NULL)"
-            )(graph, context)
-        )
-        self.assertFalse(
-            compile_predicate(
-                "EXISTS { MATCH (p:Patient) WHERE p.missing = 1 }"
-            )(graph, context)
+            compile_predicate("EXISTS { MATCH (p:Patient) WHERE p.missing = 1 }")(graph, context)
         )
         with self.assertRaises(CatalogError):
             compile_predicate("EXISTS { INSERT (n:N) FINISH }")
         with self.assertRaises(CatalogError):
-            compile_predicate(
-                "EXISTS { MATCH (n:Patient) RETURN n LIMIT 0 }"
-            )
+            compile_predicate("EXISTS { MATCH (n:Patient) RETURN n LIMIT 0 }")
         with self.assertRaises(CatalogError):
             compile_predicate("EXISTS { MATCH (n:Patient) FINISH }")
 
@@ -523,21 +492,11 @@ class PolicyLanguageTests(unittest.TestCase):
             }
         }
         self.assertIsNone(compile_predicate(unknown_json)(graph, context))
-        self.assertFalse(
-            compile_predicate({"all": [unknown_json, False]})(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate({"all": [unknown_json, True]})(graph, context)
-        )
-        self.assertTrue(
-            compile_predicate({"any": [unknown_json, True]})(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate({"any": [unknown_json, False]})(graph, context)
-        )
-        self.assertIsNone(
-            compile_predicate({"not": unknown_json})(graph, context)
-        )
+        self.assertFalse(compile_predicate({"all": [unknown_json, False]})(graph, context))
+        self.assertIsNone(compile_predicate({"all": [unknown_json, True]})(graph, context))
+        self.assertTrue(compile_predicate({"any": [unknown_json, True]})(graph, context))
+        self.assertIsNone(compile_predicate({"any": [unknown_json, False]})(graph, context))
+        self.assertIsNone(compile_predicate({"not": unknown_json})(graph, context))
 
 
 if __name__ == "__main__":

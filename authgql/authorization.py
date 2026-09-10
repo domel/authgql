@@ -23,12 +23,19 @@ class AuthorizationEngine:
         self.user = user
         self.parameters = parameters or {}
         self.metrics = metrics or ExecutionMetrics()
-        self._compiled_using = {
-            policy.name: compile_predicate(policy.using) for policy in catalog.policies
-        }
-        self._compiled_with = {
-            policy.name: compile_predicate(policy.with_check) for policy in catalog.policies
-        }
+        self._compiled_using = {}
+        self._compiled_with = {}
+        self._invalid_policies = set()
+        for policy in catalog.policies:
+            if not catalog.policy_reference_valid(policy, {graph.name}):
+                self._invalid_policies.add(policy.name)
+            try:
+                self._compiled_using[policy.name] = compile_predicate(policy.using)
+                self._compiled_with[policy.name] = compile_predicate(policy.with_check)
+            except Exception:
+                # An invalid descriptor remains in its closed scope. Do not
+                # fail an unrelated scope or silently remove a faulty policy.
+                self._invalid_policies.add(policy.name)
 
     @property
     def roles(self) -> set[str]:
@@ -73,8 +80,14 @@ class AuthorizationEngine:
         policies = self.catalog.applicable_policies(
             self.user, action, self.graph.name, selector_resource
         )
-        if not policies:
+        if not self.catalog.scope_policies(action, self.graph.name, selector_resource):
             return True
+        if not policies:
+            self.metrics.policy_denials += 1
+            return False
+        if any(p.name in self._invalid_policies for p in policies):
+            self.metrics.policy_denials += 1
+            raise AuthorizationError("Authorization policy evaluation failed", code="42000")
         context = PolicyEvaluationContext(
             user=self.user,
             roles=self.roles,
@@ -93,24 +106,16 @@ class AuthorizationEngine:
             try:
                 result = predicate(graph, context)
                 if result is not True and result is not False and result is not None:
-                    raise TypeError(
-                        "policy predicate must evaluate to TRUE, FALSE, or UNKNOWN"
-                    )
+                    raise TypeError("policy predicate must evaluate to TRUE, FALSE, or UNKNOWN")
             except Exception:  # fail closed without exposing predicate inputs
                 raise AuthorizationError(
                     "Authorization policy evaluation failed", code="42000"
                 ) from None
             evaluated.append((policy.effect, result))
-        if any(
-            effect == "DENY" and result is not False
-            for effect, result in evaluated
-        ):
+        if any(effect == "DENY" and result is not False for effect, result in evaluated):
             self.metrics.policy_denials += 1
             return False
-        if any(
-            effect == "PERMIT" and result is True
-            for effect, result in evaluated
-        ):
+        if any(effect == "PERMIT" and result is True for effect, result in evaluated):
             return True
         self.metrics.policy_denials += 1
         return False

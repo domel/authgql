@@ -84,7 +84,7 @@ class CatalogAdministrationTests(unittest.TestCase):
         )
         self.assertTrue(
             Target("NODES", "g", labels=frozenset({"A"})).covers_target(
-                Target("NODES", "g", labels=frozenset({"A", "B"}))
+                Target("NODES", "g", labels=frozenset({"A", "B"})), conjunctive=True
             )
         )
         self.assertFalse(
@@ -107,9 +107,7 @@ class CatalogAdministrationTests(unittest.TestCase):
         session = AuthGQLSession(graphs={"g": PropertyGraph("g")})
         session.execute("CREATE ROLE delegator")
         with self.assertRaises(ParseError):
-            session.execute(
-                "GRANT READ ON GRAPH g TO ROLE delegator WITH GRANT OPTION"
-            )
+            session.execute("GRANT READ ON GRAPH g TO ROLE delegator WITH GRANT OPTION")
         with self.assertRaises(ParseError):
             session.execute("GRANT READ ON GRAPH g TO alice WITH GRANT OPTION")
         session.execute("GRANT READ ON GRAPH g TO ROLE delegator")
@@ -139,20 +137,15 @@ class CatalogAdministrationTests(unittest.TestCase):
         ]:
             session.execute(statement)
         with self.assertRaises(CatalogError):
-            session.execute(
-                "REVOKE GRANT OPTION FOR READ ON GRAPH g "
-                "FROM USER alice RESTRICT"
-            )
-        session.execute(
-            "REVOKE GRANT OPTION FOR READ ON GRAPH g FROM USER alice CASCADE"
-        )
+            session.execute("REVOKE GRANT OPTION FOR READ ON GRAPH g FROM USER alice RESTRICT")
+        session.execute("REVOKE GRANT OPTION FOR READ ON GRAPH g FROM USER alice CASCADE")
         self.assertTrue(session.catalog.object_permitted("alice", "READ", "g"))
-        self.assertFalse(session.catalog.delegation_permitted("alice", "READ", Target("GRAPH", "g")))
+        self.assertFalse(
+            session.catalog.delegation_permitted("alice", "READ", Target("GRAPH", "g"))
+        )
         self.assertFalse(session.catalog.object_permitted("bob", "READ", "g"))
         self.assertTrue(session.catalog.object_permitted("carol", "SET", "g"))
-        self.assertTrue(
-            session.catalog.delegation_permitted("alice", "SET", Target("GRAPH", "g"))
-        )
+        self.assertTrue(session.catalog.delegation_permitted("alice", "SET", Target("GRAPH", "g")))
 
         session.execute("GRANT ADMINISTER ON GRAPH g TO USER scoped_admin")
         session.execute("DENY READ ON GRAPH g TO USER scoped_admin")
@@ -167,48 +160,32 @@ class CatalogAdministrationTests(unittest.TestCase):
         dana_facts = [fact for fact in session.catalog.privileges if fact.grantee == "dana"]
         self.assertEqual([fact.effect for fact in dana_facts], ["DENY"])
         session.execute("REVOKE DENY READ ON GRAPH g FROM USER dana")
-        self.assertFalse(
-            any(fact.grantee == "dana" for fact in session.catalog.privileges)
-        )
+        self.assertFalse(any(fact.grantee == "dana" for fact in session.catalog.privileges))
 
-        session.execute(
-            "GRANT READ, SET ON GRAPH g TO USER multi_parent WITH GRANT OPTION"
-        )
+        session.execute("GRANT READ, SET ON GRAPH g TO USER multi_parent WITH GRANT OPTION")
         session.execute("SET USER multi_parent")
-        session.execute(
-            "GRANT READ, SET ON GRAPH g TO USER multi_child WITH GRANT OPTION"
-        )
+        session.execute("GRANT READ, SET ON GRAPH g TO USER multi_child WITH GRANT OPTION")
         session.execute("SET USER multi_child")
         session.execute("GRANT READ, SET ON GRAPH g TO USER multi_leaf")
         session.execute("SET USER admin")
         with self.assertRaises(CatalogError):
             session.execute(
-                "REVOKE GRANT OPTION FOR READ ON GRAPH g "
-                "FROM USER multi_parent RESTRICT"
+                "REVOKE GRANT OPTION FOR READ ON GRAPH g FROM USER multi_parent RESTRICT"
             )
-        session.execute(
-            "REVOKE GRANT OPTION FOR READ ON GRAPH g "
-            "FROM USER multi_parent CASCADE"
-        )
+        session.execute("REVOKE GRANT OPTION FOR READ ON GRAPH g FROM USER multi_parent CASCADE")
         for user in ["multi_parent", "multi_child", "multi_leaf"]:
             self.assertTrue(session.catalog.object_permitted(user, "SET", "g"))
         self.assertTrue(session.catalog.object_permitted("multi_parent", "READ", "g"))
         self.assertFalse(session.catalog.object_permitted("multi_child", "READ", "g"))
         self.assertFalse(session.catalog.object_permitted("multi_leaf", "READ", "g"))
         self.assertFalse(
-            session.catalog.delegation_permitted(
-                "multi_parent", "READ", Target("GRAPH", "g")
-            )
+            session.catalog.delegation_permitted("multi_parent", "READ", Target("GRAPH", "g"))
         )
         self.assertTrue(
-            session.catalog.delegation_permitted(
-                "multi_parent", "SET", Target("GRAPH", "g")
-            )
+            session.catalog.delegation_permitted("multi_parent", "SET", Target("GRAPH", "g"))
         )
         self.assertTrue(
-            session.catalog.delegation_permitted(
-                "multi_child", "SET", Target("GRAPH", "g")
-            )
+            session.catalog.delegation_permitted("multi_child", "SET", Target("GRAPH", "g"))
         )
         parent_slices = {
             (fact.actions, fact.grant_option)
@@ -226,9 +203,7 @@ class CatalogAdministrationTests(unittest.TestCase):
 
     def test_policy_dependencies_obey_restrict_and_cascade(self) -> None:
         catalog = AuthorizationCatalog(roles={"r": set()})
-        catalog.add_policy(
-            PolicyDescriptor("base", "g", {"READ"}, {"r"}, "PERMIT")
-        )
+        catalog.add_policy(PolicyDescriptor("base", "g", {"READ"}, {"r"}, "PERMIT"))
         catalog.add_policy(
             PolicyDescriptor(
                 "dependent",
@@ -316,9 +291,7 @@ class TransactionSessionTests(unittest.TestCase):
                 ],
             }
         )
-        self.session = AuthGQLSession(
-            {"g": self.graph}, self.catalog, user="alice", graph_name="g"
-        )
+        self.session = AuthGQLSession({"g": self.graph}, self.catalog, user="alice", graph_name="g")
 
     def test_authorization_state_is_fixed_at_transaction_start(self) -> None:
         self.session.execute("START TRANSACTION READ WRITE")
@@ -330,14 +303,10 @@ class TransactionSessionTests(unittest.TestCase):
         with self.assertRaises(AuthorizationError):
             self.session.execute("MATCH (n:N) RETURN n.value AS value")
 
-        admin_session = AuthGQLSession(
-            {"g": self.graph.clone()}, user="admin", graph_name="g"
-        )
+        admin_session = AuthGQLSession({"g": self.graph.clone()}, user="admin", graph_name="g")
         admin_session.execute("START TRANSACTION READ WRITE")
         admin_session.execute("CREATE ROLE staged_role")
-        staged_roles = admin_session.execute("SHOW AUTHORIZATION")["catalog"][
-            "AUTHORIZATION_ROLES"
-        ]
+        staged_roles = admin_session.execute("SHOW AUTHORIZATION")["catalog"]["AUTHORIZATION_ROLES"]
         self.assertIn("staged_role", {row["role"] for row in staged_roles})
         admin_session.execute("ROLLBACK")
         committed_roles = admin_session.execute("SHOW AUTHORIZATION")["catalog"][
@@ -356,9 +325,7 @@ class TransactionSessionTests(unittest.TestCase):
     def test_authorization_failure_precedes_read_only_mode_failure(self) -> None:
         no_set = self.catalog.clone()
         no_set.privileges = [
-            PrivilegeFact(
-                "editor", "PERMIT", frozenset({"ACCESS", "MATCH"}), Target("GRAPH", "g")
-            )
+            PrivilegeFact("editor", "PERMIT", frozenset({"ACCESS", "MATCH"}), Target("GRAPH", "g"))
         ]
         session = AuthGQLSession({"g": self.graph.clone()}, no_set, "alice", "g")
         session.execute("START TRANSACTION READ ONLY")

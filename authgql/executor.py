@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cmp_to_key
 from time import perf_counter
-from typing import Any, Iterable
+from typing import Any, Iterable, Callable
 import copy
 import json
 import uuid
@@ -13,7 +13,9 @@ from .authorization import AuthorizationEngine
 from .catalog import AuthorizationCatalog
 from .errors import ExecutionError
 from .metrics import ExecutionMetrics
-from .model import Edge, GraphElement, Node, PropertyGraph
+from .model import Edge, GraphElement, Node, PropertyGraph, PathValue, element_key
+from .values import compare as typed_compare, truth, parameter, kind, scalar_value
+from .validation import validate_query
 from .parser import (
     BinaryExpr,
     ContextValue,
@@ -30,6 +32,7 @@ from .parser import (
     Query,
     UnaryExpr,
     VariableRef,
+    order_expression,
 )
 
 
@@ -64,12 +67,18 @@ class SecureExecutor:
         user: str,
         parameters: dict[str, Any] | None = None,
         preflight: bool = True,
+        *,
+        identity_factory: Callable[[str], str] | None = None,
     ) -> None:
         self.graph = graph
         self.catalog = catalog
         self.user = user
         self.parameters = parameters or {}
         self.preflight_enabled = preflight
+        # Trusted fixture hook; never derived from GQL property maps or parameters.
+        self.identity_factory = identity_factory or (
+            lambda kind: f"{kind.lower()}_{uuid.uuid4().hex}"
+        )
         self.metrics = ExecutionMetrics()
         self.authorization = AuthorizationEngine(
             catalog, graph, user, self.parameters, self.metrics
@@ -77,9 +86,10 @@ class SecureExecutor:
 
     def execute(self, query: Query, compare_reference: bool = False) -> ExecutionResult:
         start = perf_counter()
-        analyzer = StaticAnalyzer(
-            self.catalog, self.graph.name, self.user, metrics=self.metrics
-        )
+        validate_query(query, parameters=self.parameters)
+        if compare_reference and query.update_kind:
+            raise ExecutionError("Reference comparison is supported only for read-only queries")
+        analyzer = StaticAnalyzer(self.catalog, self.graph.name, self.user, metrics=self.metrics)
         if self.preflight_enabled:
             analyzer.preflight(query)
         else:
@@ -90,7 +100,7 @@ class SecureExecutor:
             result = self._execute_update(query)
         else:
             rows = self._evaluate_query_rows(query)
-            projected = self._project(query, rows)
+            projected = self._result_rows(query, rows, self.graph)
             result = ExecutionResult(
                 columns=[item.alias for item in query.return_items],
                 rows=projected,
@@ -127,11 +137,25 @@ class SecureExecutor:
                 if _truthy(self._eval_expr(query.where, row, active_graph)):
                     filtered.append(row)
             rows = filtered
+        return rows
+
+    def _result_rows(
+        self, query: Query, rows: list[dict[str, Any]], graph: PropertyGraph
+    ) -> list[dict[str, Any]]:
+        aggregate = any(_contains_aggregate(item.expression) for item in query.return_items)
+        if aggregate:
+            result = self._project(query, rows, graph)
+            for item in query.order_by:
+                ordered = order_expression(query, item.expression)
+                if isinstance(ordered, FunctionCall):
+                    self._eval_aggregate(ordered, rows, graph)
+            # With no grouping there is one aggregate row, so its order is fixed.
+            return result if query.limit is None else result[: query.limit]
         if query.order_by:
-            rows = self._order_rows(rows, query, active_graph)
+            rows = self._order_rows(rows, query, graph)
         if query.limit is not None:
             rows = rows[: query.limit]
-        return rows
+        return self._project(query, rows, graph)
 
     def _apply_match(
         self,
@@ -140,7 +164,9 @@ class SecureExecutor:
         graph: PropertyGraph,
     ) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
-        introduced = clause.pattern.variables
+        introduced = clause.pattern.variables - {
+            n.variable for n in clause.pattern.nodes if n.anonymous
+        }
         for input_row in input_rows:
             matches = self._match_chain(clause.pattern, input_row, graph)
             if matches:
@@ -159,11 +185,11 @@ class SecureExecutor:
         graph: PropertyGraph,
     ) -> list[dict[str, Any]]:
         first = pattern.nodes[0]
-        initial: list[tuple[dict[str, Any], Node]] = []
-        if first.variable in base_row and base_row[first.variable] is not None:
+        initial = []
+        if first.variable in base_row:
             candidate = base_row[first.variable]
             if isinstance(candidate, Node) and self._admit_node(candidate, first, base_row, graph):
-                initial.append((dict(base_row), candidate))
+                initial.append((dict(base_row), candidate, PathValue((candidate.id,), ())))
         else:
             for candidate in graph.nodes.values():
                 self.metrics.node_scan_candidates += 1
@@ -171,33 +197,52 @@ class SecureExecutor:
                     row = dict(base_row)
                     row[first.variable] = candidate
                     self.metrics.nodes_enqueued += 1
-                    initial.append((row, candidate))
+                    initial.append((row, candidate, PathValue((candidate.id,), ())))
 
         states = initial
         for edge_pattern, node_pattern in zip(pattern.edges, pattern.nodes[1:]):
-            next_states: list[tuple[dict[str, Any], Node]] = []
-            for row, current_node in states:
-                for path_edges, end_node in self._expand(
+            next_states: list[tuple[dict[str, Any], Node, PathValue]] = []
+            for row, current_node, prefix in states:
+                for path_edges, end_node, path_nodes in self._expand(
                     current_node, edge_pattern, row, node_pattern, graph
                 ):
-                    if node_pattern.variable in row and row[node_pattern.variable] is not None:
+                    if node_pattern.variable in row:
                         bound = row[node_pattern.variable]
                         if not isinstance(bound, Node) or bound.id != end_node.id:
                             continue
                     new_row = dict(row)
                     new_row[node_pattern.variable] = end_node
                     if edge_pattern.variable:
-                        new_row[edge_pattern.variable] = (
-                            path_edges[0]
-                            if edge_pattern.min_hops == edge_pattern.max_hops == 1
-                            else list(path_edges)
-                        )
+                        value = path_edges[0] if not edge_pattern.quantified else list(path_edges)
+                        if (
+                            edge_pattern.variable in row
+                            and typed_compare(row[edge_pattern.variable], "=", value) is not True
+                        ):
+                            continue
+                        new_row[edge_pattern.variable] = value
                     self.metrics.bindings_materialized += 1
-                    next_states.append((new_row, end_node))
+                    path = PathValue(
+                        prefix.nodes + tuple(path_nodes[1:]),
+                        prefix.edges + tuple(edge.id for edge in path_edges),
+                    )
+                    next_states.append((new_row, end_node, path))
             states = next_states
             if not states:
                 break
-        return [row for row, _ in states]
+        output = []
+        for row, _, path in states:
+            if pattern.path_variable:
+                if pattern.path_variable in row and row[pattern.path_variable] != path:
+                    continue
+                row[pattern.path_variable] = path
+            output.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {n.variable for n in pattern.nodes if n.anonymous}
+                }
+            )
+        return output
 
     def _admit_node(
         self,
@@ -212,7 +257,7 @@ class SecureExecutor:
             self.metrics.denied_before_enqueue += 1
             return False
         for property_name, expected in pattern.properties.items():
-            actual = self.authorization.read_property(candidate, property_name)
+            actual = self.authorization.read_property(candidate, property_name, graph=graph)
             if _compare(actual, "=", self._resolve_pattern_value(expected)) is not True:
                 return False
         return True
@@ -223,13 +268,13 @@ class SecureExecutor:
         pattern: PatternEdge,
         graph: PropertyGraph,
     ) -> bool:
-        if pattern.edge_type and edge.type != pattern.edge_type:
+        if not pattern.required_labels.issubset(edge.labels):
             return False
         if not self.authorization.permits("TRAVERSE", edge, graph=graph):
             self.metrics.denied_before_enqueue += 1
             return False
         for property_name, expected in pattern.properties.items():
-            actual = self.authorization.read_property(edge, property_name)
+            actual = self.authorization.read_property(edge, property_name, graph=graph)
             if _compare(actual, "=", self._resolve_pattern_value(expected)) is not True:
                 return False
         return True
@@ -241,17 +286,16 @@ class SecureExecutor:
         row: dict[str, Any],
         end_pattern: PatternNode,
         graph: PropertyGraph,
-    ) -> Iterable[tuple[list[Edge], Node]]:
+    ) -> Iterable[tuple[list[Edge], Node, list[str]]]:
         if edge_pattern.min_hops == 0:
             if self._admit_node(start, end_pattern, row, graph):
-                yield [], start
+                yield [], start, [start.id]
 
-        # The supported syntax has no explicit path-mode prefix, so GQL's
-        # default WALK behavior applies. The parser's finite maximum (12) keeps
-        # quantified expansion bounded even when nodes or edges repeat.
-        frontier: list[tuple[Node, list[Edge]]] = [(start, [])]
+        # WALK is the path mode; REPEATABLE ELEMENTS is this implementation's
+        # explicit/implicit match mode. Neither imposes edge uniqueness.
+        frontier: list[tuple[Node, list[Edge], list[str]]] = [(start, [], [start.id])]
         while frontier:
-            current, path = frontier.pop()
+            current, path, path_nodes = frontier.pop()
             if len(path) >= edge_pattern.max_hops:
                 continue
             for edge, neighbour in graph.adjacent(current.id, edge_pattern.direction):
@@ -268,9 +312,9 @@ class SecureExecutor:
                 if len(new_path) >= edge_pattern.min_hops and self._admit_node(
                     neighbour, end_pattern, row, graph
                 ):
-                    yield new_path, neighbour
+                    yield new_path, neighbour, [*path_nodes, neighbour.id]
                 if len(new_path) < edge_pattern.max_hops:
-                    frontier.append((neighbour, new_path))
+                    frontier.append((neighbour, new_path, [*path_nodes, neighbour.id]))
 
     # ---------- Expressions and result shaping ----------
 
@@ -278,6 +322,8 @@ class SecureExecutor:
         if isinstance(expr, Literal):
             return expr.value
         if isinstance(expr, VariableRef):
+            if expr.name.startswith("$"):
+                return parameter(self.parameters, expr.name[1:])
             upper = expr.name.upper()
             if upper == "SESSION_USER":
                 return self.user
@@ -288,12 +334,10 @@ class SecureExecutor:
                 return None
             if not isinstance(resource, (Node, Edge)):
                 raise ExecutionError(f"{expr.variable!r} is not a graph element")
-            return self.authorization.read_property(
-                resource, expr.property_name, graph=graph
-            )
+            return self.authorization.read_property(resource, expr.property_name, graph=graph)
         if isinstance(expr, LabelTest):
             resource = row.get(expr.variable)
-            return isinstance(resource, Node) and expr.label in resource.labels
+            return None if resource is None else expr.label in resource.labels
         if isinstance(expr, UnaryExpr):
             value = self._eval_expr(expr.operand, row, graph)
             if expr.op == "NOT":
@@ -322,13 +366,23 @@ class SecureExecutor:
             return _compare(left, expr.op, right)
         if isinstance(expr, FunctionCall):
             name = expr.name.upper()
+            if name == "PARAM":
+                return parameter(self.parameters, self._eval_expr(expr.args[0], row, graph))
             if name == "LIST":
                 return [self._eval_expr(arg, row, graph) for arg in expr.args]
             if name in {"ID", "ELEMENT_ID"}:
                 if len(expr.args) != 1:
                     raise ExecutionError(f"{name} expects one argument")
                 resource = self._eval_expr(expr.args[0], row, graph)
-                return resource.id if isinstance(resource, (Node, Edge)) else None
+                if resource is None:
+                    return None
+                if name == "ID":  # Legacy helper, not the standard identity function.
+                    return resource.id
+                return json.dumps(
+                    [graph.name, resource.kind, resource.id],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             if name == "COALESCE":
                 for arg in expr.args:
                     value = self._eval_expr(arg, row, graph)
@@ -358,17 +412,13 @@ class SecureExecutor:
                 )
             projected: dict[str, Any] = {}
             for item in query.return_items:
-                projected[item.alias] = self._eval_aggregate(
-                    item.expression, rows, active_graph
-                )
+                projected[item.alias] = self._eval_aggregate(item.expression, rows, active_graph)
             return [projected]
 
         output: list[dict[str, Any]] = []
         for row in rows:
             result_row = {
-                item.alias: _json_value(
-                    self._eval_expr(item.expression, row, active_graph)
-                )
+                item.alias: _json_value(self._eval_expr(item.expression, row, active_graph))
                 for item in query.return_items
             }
             output.append(result_row)
@@ -387,23 +437,38 @@ class SecureExecutor:
         argument = expr.args[0]
         if isinstance(argument, VariableRef) and argument.name == "*":
             return len(rows)
-        return sum(
-            1 for row in rows if self._eval_expr(argument, row, graph) is not None
-        )
+        return sum(1 for row in rows if self._eval_expr(argument, row, graph) is not None)
 
     def _order_rows(
         self, rows: list[dict[str, Any]], query: Query, graph: PropertyGraph
     ) -> list[dict[str, Any]]:
-        def compare_rows(left_row: dict[str, Any], right_row: dict[str, Any]) -> int:
-            for item in query.order_by:
-                left = self._eval_expr(item.expression, left_row, graph)
-                right = self._eval_expr(item.expression, right_row, graph)
+        # Evaluate every guarded key once, including a one-row input. Sorting
+        # may perform no comparisons, but must not suppress an explicit READ.
+        decorated = [
+            (
+                row,
+                [
+                    self._eval_expr(order_expression(query, item.expression), row, graph)
+                    for item in query.order_by
+                ],
+            )
+            for row in rows
+        ]
+        for _, keys in decorated:
+            for value in keys:
+                if kind(value) not in {"NULL", "NUMBER", "STRING", "BOOL"}:
+                    raise ExecutionError("Unsupported ordering key type", code="22000")
+
+        def compare_rows(
+            left_row: tuple[dict[str, Any], list[Any]], right_row: tuple[dict[str, Any], list[Any]]
+        ) -> int:
+            for item, left, right in zip(query.order_by, left_row[1], right_row[1]):
                 comparison = _safe_compare(left, right)
                 if comparison:
                     return -comparison if item.descending else comparison
             return 0
 
-        return sorted(rows, key=cmp_to_key(compare_rows))
+        return [row for row, _ in sorted(decorated, key=cmp_to_key(compare_rows))]
 
     # ---------- Transactional updates ----------
 
@@ -413,15 +478,20 @@ class SecureExecutor:
 
         rows = self._evaluate_query_rows(query)
         prospective = self.graph.clone()
-        affected: set[str] = set()
+        affected: set[tuple[str, str]] = set()
         return_rows = rows
 
         if query.update_kind == "SET":
-            staged: dict[str, dict[str, Any]] = {}
-            original_by_id: dict[str, GraphElement] = {}
+            staged: dict[tuple[str, str], dict[str, Any]] = {}
+            original_by_id: dict[tuple[str, str], GraphElement] = {}
             for row in rows:
                 for assignment in query.set_assignments:
                     resource = row.get(assignment.variable)
+                    if resource is None:
+                        # GQL evaluates RHS values even for a null target. Their
+                        # reads still need guards, but there is no element to modify.
+                        self._eval_expr(assignment.expression, row, self.graph)
+                        continue
                     if not isinstance(resource, (Node, Edge)):
                         raise ExecutionError(
                             f"SET variable {assignment.variable!r} is not bound to a graph element"
@@ -429,8 +499,11 @@ class SecureExecutor:
                     self.metrics.update_candidates += 1
                     self.authorization.check("SET", resource, assignment.property_name)
                     value = self._eval_expr(assignment.expression, row, self.graph)
-                    staged.setdefault(resource.id, {})[assignment.property_name] = copy.deepcopy(value)
-                    original_by_id[resource.id] = resource
+                    scalar_value(value)
+                    staged.setdefault(element_key(resource), {})[assignment.property_name] = (
+                        copy.deepcopy(value)
+                    )
+                    original_by_id[element_key(resource)] = resource
 
             for element_id, changes in staged.items():
                 clone_element = prospective.element(element_id)
@@ -445,31 +518,27 @@ class SecureExecutor:
                 affected.add(element_id)
 
             return_rows = [
-                {
-                    key: (prospective.element(value.id) if isinstance(value, (Node, Edge)) and value.id in prospective.nodes | prospective.edges else value)
-                    for key, value in row.items()
-                }
-                for row in rows
+                {key: self._remap(value, prospective) for key, value in row.items()} for row in rows
             ]
 
         elif query.update_kind == "REMOVE":
-            staged_removals: dict[str, set[str]] = {}
-            removal_originals: dict[str, GraphElement] = {}
+            staged_removals: dict[tuple[str, str], set[str]] = {}
+            removal_originals: dict[tuple[str, str], GraphElement] = {}
             for row in rows:
                 for remove_assignment in query.remove_assignments:
                     resource = row.get(remove_assignment.variable)
+                    if resource is None:
+                        continue
                     if not isinstance(resource, (Node, Edge)):
                         raise ExecutionError(
                             f"REMOVE variable {remove_assignment.variable!r} is not bound to a graph element"
                         )
                     self.metrics.update_candidates += 1
-                    self.authorization.check(
-                        "REMOVE", resource, remove_assignment.property_name
-                    )
-                    staged_removals.setdefault(resource.id, set()).add(
+                    self.authorization.check("REMOVE", resource, remove_assignment.property_name)
+                    staged_removals.setdefault(element_key(resource), set()).add(
                         remove_assignment.property_name
                     )
-                    removal_originals[resource.id] = resource
+                    removal_originals[element_key(resource)] = resource
 
             for element_id, property_names in staged_removals.items():
                 clone_element = prospective.element(element_id)
@@ -485,38 +554,31 @@ class SecureExecutor:
                 affected.add(element_id)
 
             return_rows = [
-                {
-                    key: (
-                        prospective.element(value.id)
-                        if isinstance(value, (Node, Edge))
-                        and value.id in prospective.nodes | prospective.edges
-                        else value
-                    )
-                    for key, value in row.items()
-                }
-                for row in rows
+                {key: self._remap(value, prospective) for key, value in row.items()} for row in rows
             ]
 
         elif query.update_kind == "DELETE":
-            to_delete: dict[str, GraphElement] = {}
+            to_delete: dict[tuple[str, str], GraphElement] = {}
             for row in rows:
                 for variable in query.delete_variables:
                     resource = row.get(variable)
+                    if resource is None:
+                        continue
                     if not isinstance(resource, (Node, Edge)):
                         raise ExecutionError(
                             f"DELETE variable {variable!r} is not bound to a graph element"
                         )
-                    to_delete[resource.id] = resource
+                    to_delete[element_key(resource)] = resource
             explicitly_deleted = set(to_delete)
 
             # Element-level authorization is part of the request check and must
             # precede ordinary NODETACH validation. Otherwise G1001 could reveal
             # incident topology for a resource whose DELETE policy denies access.
-            authorized_for_delete: set[str] = set()
+            authorized_for_delete: set[tuple[str, str]] = set()
             for resource in to_delete.values():
                 self.metrics.update_candidates += 1
                 self.authorization.check("DELETE", resource)
-                authorized_for_delete.add(resource.id)
+                authorized_for_delete.add(element_key(resource))
 
             for resource in list(to_delete.values()):
                 if not isinstance(resource, Node):
@@ -526,9 +588,11 @@ class SecureExecutor:
                 ]
                 if query.delete_detach:
                     for edge_id in dict.fromkeys(incident_ids):
-                        to_delete.setdefault(edge_id, self.graph.edges[edge_id])
+                        to_delete.setdefault(("EDGE", edge_id), self.graph.edges[edge_id])
                 else:
-                    missing = set(incident_ids).difference(explicitly_deleted)
+                    missing = {("EDGE", edge_id) for edge_id in incident_ids}.difference(
+                        explicitly_deleted
+                    )
                     if missing:
                         raise ExecutionError(
                             "NODETACH DELETE requires every incident edge to be explicitly deleted",
@@ -536,26 +600,22 @@ class SecureExecutor:
                         )
 
             for resource in to_delete.values():
-                if resource.id not in authorized_for_delete:
+                if element_key(resource) not in authorized_for_delete:
                     self.metrics.update_candidates += 1
                     self.authorization.check("DELETE", resource)
-                    authorized_for_delete.add(resource.id)
+                    authorized_for_delete.add(element_key(resource))
             for resource in to_delete.values():
                 if isinstance(resource, Edge) and resource.id in prospective.edges:
                     prospective.delete_edge(resource.id)
-                affected.add(resource.id)
+                affected.add(element_key(resource))
             for resource in to_delete.values():
                 if isinstance(resource, Node) and resource.id in prospective.nodes:
                     prospective.delete_node(resource.id)
-                    affected.add(resource.id)
+                    affected.add(element_key(resource))
         else:
             raise ExecutionError(f"Unsupported update kind: {query.update_kind}")
 
-        projected = (
-            self._project(query, return_rows, prospective)
-            if query.return_items
-            else []
-        )
+        projected = self._result_rows(query, return_rows, prospective) if query.return_items else []
         self.graph.replace_with(prospective)
         return ExecutionResult(
             columns=[item.alias for item in query.return_items],
@@ -569,16 +629,19 @@ class SecureExecutor:
         prospective = self.graph.clone()
         source_rows = self._evaluate_query_rows(query) if query.matches else [{}]
         result_rows: list[dict[str, Any]] = []
-        inserted: dict[str, GraphElement] = {}
+        inserted: dict[tuple[str, str], GraphElement] = {}
         existing_endpoints: dict[str, GraphElement] = {}
 
         for source_row in source_rows:
             row = dict(source_row)
             for pattern in query.insert_patterns:
-                pattern_nodes: list[Node] = []
+                pattern_nodes: list[Node | None] = []
                 for node_spec in pattern.nodes:
                     bound = row.get(node_spec.variable)
-                    if bound is not None:
+                    if node_spec.variable in row:
+                        if bound is None:
+                            pattern_nodes.append(None)
+                            continue
                         if not isinstance(bound, Node):
                             raise ExecutionError(
                                 f"INSERT endpoint {node_spec.variable!r} is not a node"
@@ -586,45 +649,43 @@ class SecureExecutor:
                         node = prospective.nodes.get(bound.id)
                         if node is None:
                             raise ExecutionError(
-                                f"INSERT endpoint {bound.id!r} is absent from the prospective graph"
+                                "INSERT endpoint is absent from the working graph", code="G1003"
                             )
                         if node_spec.labels and not node_spec.labels.issubset(node.labels):
                             raise ExecutionError(
                                 f"Bound INSERT endpoint {bound.id!r} does not satisfy its labels"
                             )
-                        if node.id not in inserted:
+                        if element_key(node) not in inserted:
                             existing_endpoints[node.id] = self.graph.nodes[node.id]
                     else:
-                        element_id = str(
-                            node_spec.properties.get("_id") or f"n_{uuid.uuid4().hex[:12]}"
-                        )
+                        element_id = self._new_identity("NODE")
                         properties = {
                             key: self._resolve_pattern_value(value)
                             for key, value in node_spec.properties.items()
-                            if key != "_id"
                         }
                         node = Node(element_id, set(node_spec.labels), properties)
                         prospective.add_node(node)
-                        inserted[node.id] = node
+                        inserted[element_key(node)] = node
                         row[node_spec.variable] = node
                     pattern_nodes.append(node)
 
                 for index, edge_spec in enumerate(pattern.edges):
                     if edge_spec.min_hops != 1 or edge_spec.max_hops != 1:
                         raise ExecutionError("INSERT does not accept quantified edge patterns")
-                    edge_id = str(
-                        edge_spec.properties.get("_id") or f"e_{uuid.uuid4().hex[:12]}"
-                    )
+                    edge_id = self._new_identity("EDGE")
                     properties = {
                         key: self._resolve_pattern_value(value)
                         for key, value in edge_spec.properties.items()
-                        if key != "_id"
                     }
                     left = pattern_nodes[index]
                     right = pattern_nodes[index + 1]
+                    if left is None or right is None:
+                        raise ExecutionError(
+                            "INSERT endpoint is not a node in the working graph", code="G1003"
+                        )
                     if edge_spec.direction == "in":
                         source, target = right, left
-                    elif edge_spec.direction == "out":
+                    elif edge_spec.direction in {"out", "undirected"}:
                         source, target = left, right
                     else:
                         raise ExecutionError(
@@ -636,9 +697,11 @@ class SecureExecutor:
                         source.id,
                         target.id,
                         properties,
+                        labels=edge_spec.required_labels,
+                        directed=edge_spec.direction != "undirected",
                     )
                     prospective.add_edge(edge)
-                    inserted[edge.id] = edge
+                    inserted[element_key(edge)] = edge
                     if edge_spec.variable:
                         row[edge_spec.variable] = edge
             result_rows.append(row)
@@ -651,11 +714,7 @@ class SecureExecutor:
         for endpoint in existing_endpoints.values():
             self.authorization.check("TRAVERSE", endpoint)
 
-        projected = (
-            self._project(query, result_rows, prospective)
-            if query.return_items
-            else []
-        )
+        projected = self._result_rows(query, result_rows, prospective) if query.return_items else []
         self.graph.replace_with(prospective)
         return ExecutionResult(
             columns=[item.alias for item in query.return_items],
@@ -672,7 +731,7 @@ class SecureExecutor:
         # This internal cross-check shares major execution components. It is neither
         # independent validation nor a proof of storage-level traversal-touch safety.
         reference_metrics = ExecutionMetrics()
-        reference_auth = AuthorizationEngine(
+        reference_auth = _RawPolicyReferenceEngine(
             self.catalog, self.graph, self.user, self.parameters, reference_metrics
         )
         allowed_nodes = {
@@ -695,13 +754,43 @@ class SecureExecutor:
             self.parameters,
             preflight=self.preflight_enabled,
         )
+        executor.authorization = reference_auth
         return executor.execute(query, compare_reference=False)
+
+    def _new_identity(self, kind: str) -> str:
+        identifier = self.identity_factory(kind)
+        if not isinstance(identifier, str) or not identifier:
+            raise ExecutionError("Identity factory must return a nonempty string", code="22000")
+        return identifier
 
     def _resolve_pattern_value(self, value: Any) -> Any:
         if isinstance(value, ContextValue):
+            if value.name.startswith("$"):
+                return parameter(self.parameters, value.name[1:])
             if value.name == "SESSION_USER":
                 return self.user
         return value
+
+    @staticmethod
+    def _remap(value: Any, graph: PropertyGraph) -> Any:
+        if isinstance(value, (Node, Edge)):
+            return graph.element(element_key(value))
+        if isinstance(value, list):
+            return [SecureExecutor._remap(item, graph) for item in value]
+        return value
+
+
+class _RawPolicyReferenceEngine(AuthorizationEngine):
+    """Read-only cross-check adapter: topology changes, raw policy context does not."""
+
+    def check(
+        self,
+        action: str,
+        resource: GraphElement,
+        property_name: str | None = None,
+        graph: PropertyGraph | None = None,
+    ) -> None:
+        super().check(action, resource, property_name, graph=self.graph)
 
 
 def _contains_aggregate(expr: Expr) -> bool:
@@ -715,46 +804,22 @@ def _contains_aggregate(expr: Expr) -> bool:
 
 
 def _compare(left: Any, op: str, right: Any) -> bool | None:
-    if op == "IN":
-        if left is None or right is None:
-            return None
-        if not isinstance(right, list):
-            raise ExecutionError("IN expects a list on the right-hand side")
-        saw_unknown = False
-        for item in right:
-            comparison = _compare(left, "=", item)
-            if comparison is True:
-                return True
-            saw_unknown = saw_unknown or comparison is None
-        return None if saw_unknown else False
-    if left is None or right is None:
-        return None
-    if op in {"=", "=="}:
-        return left == right
-    if op in {"<>", "!="}:
-        return left != right
-    if op == "<":
-        return left < right
-    if op == "<=":
-        return left <= right
-    if op == ">":
-        return left > right
-    if op == ">=":
-        return left >= right
-    raise ExecutionError(f"Unsupported comparison operator: {op}")
+    return typed_compare(left, op, right)
 
 
 def _truthy(value: Any) -> bool:
-    return value is True
+    return truth(value) is True
 
 
 def _gql_not(value: Any) -> bool | None:
+    value = truth(value)
     if value is None:
         return None
     return not bool(value)
 
 
 def _gql_and(left: Any, right: Any) -> bool | None:
+    left, right = truth(left), truth(right)
     if left is False or right is False:
         return False
     if left is None or right is None:
@@ -763,6 +828,7 @@ def _gql_and(left: Any, right: Any) -> bool | None:
 
 
 def _gql_or(left: Any, right: Any) -> bool | None:
+    left, right = truth(left), truth(right)
     if left is True or right is True:
         return True
     if left is None or right is None:
@@ -777,14 +843,23 @@ def _safe_compare(left: Any, right: Any) -> int:
         return 1
     if right is None:
         return -1
-    if left < right:
+    if kind(left) == kind(right) == "BOOL":
+        return (left > right) - (left < right)
+    if typed_compare(left, "<", right):
         return -1
-    if left > right:
+    if typed_compare(left, ">", right):
         return 1
     return 0
 
 
 def _json_value(value: Any) -> Any:
+    if isinstance(value, PathValue):
+        elements = []
+        for index, node_id in enumerate(value.nodes):
+            elements.append({"kind": "node", "id": node_id})
+            if index < len(value.edges):
+                elements.append({"kind": "edge", "id": value.edges[index]})
+        return {"kind": "path", "elements": elements}
     if isinstance(value, Node):
         # GQL returns a graph-element reference value. Serializing the backing
         # property map here would bypass explicit READ guards on ``n.property``.

@@ -74,10 +74,7 @@ def rejected_write_case() -> dict[str, Any]:
     before = graph.to_dict()
     try:
         SecureExecutor(graph, catalog, "alice").execute(
-            parse_query(
-                "MATCH (p:Patient) WHERE p.age = 42 "
-                "SET p.classification = 'sealed' FINISH"
-            )
+            parse_query("MATCH (p:Patient) WHERE p.age = 42 SET p.classification = 'sealed' FINISH")
         )
     except AuthGQLError as exc:
         return {
@@ -109,8 +106,7 @@ def main() -> int:
         ),
         read_case(
             "guarded_quantified_path",
-            "MATCH (p:Patient)-[:HAS_DIAGNOSIS*1..3]->(d:Diagnosis) "
-            "RETURN d.code AS diagnosis",
+            "MATCH (p:Patient)-[:HAS_DIAGNOSIS*1..3]->(d:Diagnosis) RETURN d.code AS diagnosis",
         ),
         denied_case(
             "protected_property",

@@ -21,6 +21,7 @@ class PatternNode:
     labels: set[str] = field(default_factory=set)
     properties: dict[str, Any] = field(default_factory=dict)
     anonymous: bool = False
+    decorated: bool = False
 
 
 @dataclass
@@ -31,17 +32,27 @@ class PatternEdge:
     min_hops: int = 1
     max_hops: int = 1
     properties: dict[str, Any] = field(default_factory=dict)
+    labels: set[str] = field(default_factory=set)
+    quantified: bool = False
+
+    @property
+    def required_labels(self) -> set[str]:
+        return self.labels | ({self.edge_type} if self.edge_type else set())
 
 
 @dataclass
 class PatternChain:
     nodes: list[PatternNode]
     edges: list[PatternEdge]
+    path_variable: str | None = None
+    path_mode: str = "WALK"
 
     @property
     def variables(self) -> set[str]:
         result = {node.variable for node in self.nodes}
         result.update(edge.variable for edge in self.edges if edge.variable)
+        if self.path_variable:
+            result.add(self.path_variable)
         return result
 
 
@@ -148,6 +159,8 @@ class Query:
     insert_nodes: list[InsertNode] = field(default_factory=list)
     insert_patterns: list[PatternChain] = field(default_factory=list)
     source: str = ""
+    return_all: bool = False
+    match_mode: str = "REPEATABLE ELEMENTS"
 
 
 # ---------- Generic splitting/scanning ----------
@@ -173,7 +186,7 @@ def strip_comments(text: str) -> str:
             if char in {"'", '"'}:
                 quote = char
                 continue
-            if char == "#" or (char == "-" and index + 1 < len(line) and line[index + 1] == "-"):
+            if char == "#" or line[index : index + 2] in {"--", "//"}:
                 cut = index
                 break
         lines.append(line[:cut])
@@ -307,7 +320,9 @@ def scan_clauses(text: str) -> list[tuple[str, str]]:
             matched = None
             for keyword in sorted_keywords:
                 if upper.startswith(keyword, index):
-                    before_ok = index == 0 or not (upper[index - 1].isalnum() or upper[index - 1] == "_")
+                    before_ok = index == 0 or not (
+                        upper[index - 1].isalnum() or upper[index - 1] == "_"
+                    )
                     end = index + len(keyword)
                     after_ok = end == len(text) or not (upper[end].isalnum() or upper[end] == "_")
                     if before_ok and after_ok:
@@ -344,8 +359,15 @@ def parse_literal(text: str) -> Any:
     if not text:
         raise ParseError("Empty literal")
     if (text[0] == text[-1]) and text[0] in {"'", '"'}:
-        value = text[1:-1]
-        return bytes(value, "utf-8").decode("unicode_escape")
+        value = text[1:-1].replace(text[0] * 2, text[0])
+        escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "'": "'", '"': '"'}
+
+        def unescape(match: re.Match[str]) -> str:
+            if match[1] not in escapes:
+                raise ParseError("Unsupported string escape")
+            return escapes[match[1]]
+
+        return re.sub(r"\\(.)", unescape, value)
     upper = text.upper()
     if upper == "TRUE":
         return True
@@ -355,6 +377,8 @@ def parse_literal(text: str) -> Any:
         return None
     if upper == "SESSION_USER":
         return ContextValue(upper)
+    if re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", text):
+        return ContextValue(text)
     if _NUMBER_RE.match(text):
         return float(text) if "." in text else int(text)
     raise ParseError(f"Unsupported literal: {text!r}")
@@ -374,9 +398,11 @@ def parse_property_map(text: str) -> dict[str, Any]:
         if ":" not in item:
             raise ParseError(f"Invalid property map entry: {item!r}")
         key, value = item.split(":", 1)
-        key = key.strip().strip("`\"")
+        key = key.strip().strip('`"')
         if not _IDENTIFIER_RE.match(key):
             raise ParseError(f"Invalid property name: {key!r}")
+        if key in result:
+            raise ParseError("Duplicate property map key")
         result[key] = parse_literal(value)
     return result
 
@@ -387,6 +413,14 @@ class PatternParser:
 
     def parse_chain(self, text: str) -> PatternChain:
         text = text.strip()
+        path_variable = None
+        declaration = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*", text)
+        if declaration:
+            path_variable = declaration[1]
+            text = text[declaration.end() :].lstrip()
+        mode = re.match(r"WALK\b\s*", text, re.I)
+        if mode:
+            text = text[mode.end() :]
         position = 0
         nodes: list[PatternNode] = []
         edges: list[PatternEdge] = []
@@ -402,7 +436,7 @@ class PatternParser:
             nodes.append(node)
         if len(nodes) != len(edges) + 1:
             raise ParseError(f"Malformed path pattern: {text!r}")
-        return PatternChain(nodes=nodes, edges=edges)
+        return PatternChain(nodes=nodes, edges=edges, path_variable=path_variable)
 
     @staticmethod
     def _skip_ws(text: str, position: int) -> int:
@@ -428,16 +462,31 @@ class PatternParser:
             property_map = parse_property_map(token[brace_index : brace_end + 1])
             token = token[:brace_index].strip()
 
-        variable_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", token)
-        if variable_match:
-            variable = variable_match.group(1)
+        variable, labels = self._parse_filler(token)
+        if variable:
             anonymous = False
         else:
             self.anonymous_counter += 1
-            variable = f"_anon{self.anonymous_counter}"
+            # Internal names are inaccessible to source expressions and are
+            # discarded after matching, so nested EXISTS cannot capture them.
+            variable = f"@anon{self.anonymous_counter}"
             anonymous = True
-        labels = set(re.findall(r":\s*([A-Za-z_][A-Za-z0-9_]*)", token))
-        return PatternNode(variable, labels, property_map, anonymous)
+        return PatternNode(
+            variable, labels, property_map, anonymous, brace_index is not None or bool(labels)
+        )
+
+    @staticmethod
+    def _parse_filler(token: str) -> tuple[str | None, set[str]]:
+        name = r"[A-Za-z_][A-Za-z0-9_]*"
+        match = re.fullmatch(
+            rf"\s*(?:(?!IS\b)({name}))?\s*"
+            rf"(?:(?::|IS\b)\s*({name}(?:\s*[:&]\s*{name})*))?\s*",
+            token,
+            re.I,
+        )
+        if not match:
+            raise ParseError(f"Unsupported element pattern filler: {token!r}")
+        return match[1], set(re.split(r"\s*[:&]\s*", match[2])) if match[2] else set()
 
     def _parse_edge_at(self, text: str, position: int) -> tuple[PatternEdge, int]:
         position = self._skip_ws(text, position)
@@ -461,7 +510,7 @@ class PatternParser:
             else:
                 raise ParseError("Edge pattern must end with ]-> or ]-")
         elif text.startswith("~[", position):
-            direction = "both"
+            direction = "undirected"
             open_bracket = position + 1
             close_bracket = _find_matching(text, open_bracket, "[", "]")
             if not text.startswith("~", close_bracket + 1):
@@ -470,7 +519,20 @@ class PatternParser:
         else:
             raise ParseError(f"Expected edge pattern at: {text[position:]!r}")
         token = text[open_bracket + 1 : close_bracket].strip()
-        return self._parse_edge_token(token, direction), next_position
+        edge = self._parse_edge_token(token, direction)
+        next_position = self._skip_ws(text, next_position)
+        if text[next_position : next_position + 1] == "{":
+            end = _find_matching(text, next_position, "{", "}")
+            match = re.fullmatch(r"\{\s*(\d+)\s*(?:,\s*(\d+)\s*)?\}", text[next_position : end + 1])
+            if not match or edge.quantified:
+                raise ParseError("Expected one finite bounded path quantifier")
+            edge.min_hops = int(match[1])
+            edge.max_hops = int(match[2] or match[1])
+            edge.quantified = True
+            next_position = end + 1
+        if not 0 <= edge.min_hops <= edge.max_hops <= 12:
+            raise ParseError("Path bounds must satisfy 0 <= minimum <= maximum <= 12")
+        return edge, next_position
 
     def _parse_edge_token(self, token: str, direction: str) -> PatternEdge:
         properties: dict[str, Any] = {}
@@ -494,23 +556,17 @@ class PatternParser:
                 raise ParseError("Prototype limits variable-length paths to at most 12 hops")
             token = token[: quantifier.start()] + token[quantifier.end() :]
 
-        token = token.strip()
-        variable: str | None = None
-        edge_type: str | None = None
-        if ":" in token:
-            before, after = token.split(":", 1)
-            before = before.strip()
-            after = after.strip()
-            variable = before or None
-            edge_type_match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", after)
-            if not edge_type_match:
-                raise ParseError(f"Invalid edge-label shorthand in {token!r}")
-            edge_type = edge_type_match.group(1)
-        elif token:
-            if not _IDENTIFIER_RE.match(token):
-                raise ParseError(f"Invalid edge variable: {token!r}")
-            variable = token
-        return PatternEdge(variable, edge_type, direction, min_hops, max_hops, properties)
+        variable, labels = self._parse_filler(token.strip())
+        return PatternEdge(
+            variable,
+            next(iter(sorted(labels)), None),
+            direction,
+            min_hops,
+            max_hops,
+            properties,
+            labels,
+            bool(quantifier),
+        )
 
     @staticmethod
     def _top_level_char(text: str, wanted: str) -> int | None:
@@ -551,7 +607,8 @@ class Token:
 
 _TOKEN_RE = re.compile(
     r"\s*(?:"
-    r"(?P<STRING>'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")|"
+    r"(?P<STRING>'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\")|"
+    r"(?P<PARAM>\$[A-Za-z_][A-Za-z0-9_]*)|"
     r"(?P<NUMBER>[+-]?(?:\d+\.\d+|\d+))|"
     r"(?P<OP><>|!=|<=|>=|=|<|>)|"
     r"(?P<LPAREN>\()|(?P<RPAREN>\))|"
@@ -594,7 +651,9 @@ def _extract_exists(text: str) -> tuple[str, dict[str, str]]:
         if upper.startswith("EXISTS", index):
             before_ok = index == 0 or not (upper[index - 1].isalnum() or upper[index - 1] == "_")
             end_word = index + 6
-            after_ok = end_word == len(text) or not (upper[end_word].isalnum() or upper[end_word] == "_")
+            after_ok = end_word == len(text) or not (
+                upper[end_word].isalnum() or upper[end_word] == "_"
+            )
             if before_ok and after_ok:
                 brace_start = end_word
                 while brace_start < len(text) and text[brace_start].isspace():
@@ -706,6 +765,9 @@ class ExpressionParser:
 
     def parse_primary(self) -> Expr:
         token = self.current()
+        if token.kind == "PARAM":
+            self.advance()
+            return VariableRef(token.value)
         if self.accept("LPAREN"):
             result = self.parse_or()
             self.expect("RPAREN")
@@ -775,7 +837,11 @@ def _parse_order_items(text: str) -> list[OrderItem]:
         match = re.match(r"^(.*?)(?:\s+(ASC|DESC))?$", item.strip(), re.I | re.S)
         if not match:
             raise ParseError(f"Invalid ORDER BY item: {item!r}")
-        result.append(OrderItem(parse_expression(match.group(1).strip()), (match.group(2) or "").upper() == "DESC"))
+        result.append(
+            OrderItem(
+                parse_expression(match.group(1).strip()), (match.group(2) or "").upper() == "DESC"
+            )
+        )
     return result
 
 
@@ -789,7 +855,9 @@ def _parse_set_assignments(text: str) -> list[SetAssignment]:
         )
         if not match:
             raise ParseError(f"Invalid SET assignment: {item!r}")
-        result.append(SetAssignment(match.group(1), match.group(2), parse_expression(match.group(3))))
+        result.append(
+            SetAssignment(match.group(1), match.group(2), parse_expression(match.group(3)))
+        )
     return result
 
 
@@ -801,9 +869,7 @@ def _parse_remove_assignments(text: str) -> list[RemoveAssignment]:
             item.strip(),
         )
         if not match:
-            raise ParseError(
-                "The prototype supports property removal as REMOVE variable.property"
-            )
+            raise ParseError("The prototype supports property removal as REMOVE variable.property")
         result.append(RemoveAssignment(match.group(1), match.group(2)))
     return result
 
@@ -816,14 +882,52 @@ def parse_query(text: str, allow_no_return: bool = False) -> Query:
     pattern_parser = PatternParser()
     query = Query(source=source)
     seen_update = False
+    rank = -1
+    seen = set()
 
     for keyword, content in clauses:
+        order = {
+            "MATCH": 0,
+            "OPTIONAL MATCH": 0,
+            "WHERE": 1,
+            "INSERT": 2,
+            "SET": 2,
+            "REMOVE": 2,
+            "DELETE": 2,
+            "DETACH DELETE": 2,
+            "NODETACH DELETE": 2,
+            "RETURN": 3,
+            "FINISH": 3,
+            "ORDER BY": 4,
+            "LIMIT": 5,
+        }[keyword]
+        if order < rank or (keyword in seen and order != 0):
+            raise ParseError("Unsupported or repeated clause ordering in this fragment")
+        if (keyword == "RETURN" and "FINISH" in seen) or (keyword == "FINISH" and "RETURN" in seen):
+            raise ParseError("RETURN and FINISH are alternatives")
+        if not content and keyword != "FINISH":
+            raise ParseError("Empty clause")
+        if keyword == "FINISH" and content:
+            raise ParseError("FINISH has no operands")
+        rank = order
+        seen.add(keyword)
         if keyword in {"MATCH", "OPTIONAL MATCH"}:
             if seen_update:
                 raise ParseError("MATCH cannot follow a data-modifying clause in this prototype")
+            mode = re.match(
+                r"REPEATABLE\s+(?:ELEMENTS|ELEMENT(?:\s+BINDINGS)?)\b\s*", content, re.I
+            )
+            if mode:
+                content = content[mode.end() :]
+            if re.match(r"DIFFERENT\b", content, re.I):
+                raise ParseError(
+                    "This fragment implements REPEATABLE ELEMENTS, not DIFFERENT EDGES"
+                )
             for chain_text in split_top_level(content):
                 query.matches.append(
-                    MatchClause(pattern_parser.parse_chain(chain_text), optional=keyword == "OPTIONAL MATCH")
+                    MatchClause(
+                        pattern_parser.parse_chain(chain_text), optional=keyword == "OPTIONAL MATCH"
+                    )
                 )
         elif keyword == "WHERE":
             if query.where is not None:
@@ -831,6 +935,12 @@ def parse_query(text: str, allow_no_return: bool = False) -> Query:
             query.where = parse_expression(content)
         elif keyword == "RETURN":
             query.return_items = _parse_return_items(content)
+            query.return_all = content.strip() == "*"
+            if not query.return_all and any(
+                isinstance(item.expression, VariableRef) and item.expression.name == "*"
+                for item in query.return_items
+            ):
+                raise ParseError("RETURN * cannot be aliased or mixed with explicit return items")
         elif keyword == "ORDER BY":
             query.order_by = _parse_order_items(content)
         elif keyword == "LIMIT":
@@ -868,12 +978,14 @@ def parse_query(text: str, allow_no_return: bool = False) -> Query:
             query.update_kind = "INSERT"
             for item in split_top_level(content):
                 chain = pattern_parser.parse_chain(item)
-                if any(edge.min_hops != 1 or edge.max_hops != 1 for edge in chain.edges):
+                if chain.path_variable or any(edge.quantified for edge in chain.edges):
                     raise ParseError("INSERT edge patterns cannot be quantified")
                 query.insert_patterns.append(chain)
                 if not chain.edges and len(chain.nodes) == 1:
                     node = chain.nodes[0]
-                    query.insert_nodes.append(InsertNode(node.variable, node.labels, node.properties))
+                    query.insert_nodes.append(
+                        InsertNode(node.variable, node.labels, node.properties)
+                    )
             seen_update = True
         elif keyword == "FINISH":
             query.return_items = []
@@ -884,7 +996,17 @@ def parse_query(text: str, allow_no_return: bool = False) -> Query:
         raise ParseError("A query must contain MATCH or INSERT")
     if not allow_no_return and not query.return_items and query.update_kind is None:
         raise ParseError("Read-only queries require RETURN")
+    if (query.order_by or query.limit is not None) and not query.return_items:
+        raise ParseError("ORDER BY and LIMIT require RETURN in this fragment")
     return query
+
+
+def order_expression(query: Query, expr: Expr) -> Expr:
+    if isinstance(expr, VariableRef):
+        for item in query.return_items:
+            if item.alias == expr.name:
+                return item.expression
+    return expr
 
 
 def walk_expr(expr: Expr | None) -> Iterator[Expr]:

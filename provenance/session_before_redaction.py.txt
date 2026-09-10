@@ -19,7 +19,6 @@ from .metrics import ExecutionMetrics
 from .model import PropertyGraph
 from .parser import parse_query, strip_comments
 from .policy import compile_predicate
-from .validation import validate_query
 
 
 _IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -240,7 +239,9 @@ class AuthGQLSession:
             raise ParseError(f"Unsupported transaction access mode: {mode!r}")
         self._in_transaction = True
         self._transaction_mode = mode
-        self._working_graphs = {name: graph.clone() for name, graph in self.graphs.items()}
+        self._working_graphs = {
+            name: graph.clone() for name, graph in self.graphs.items()
+        }
         self._authorization_snapshot = self.catalog.clone()
         self._staged_catalog = self.catalog.clone()
         self._catalog_dirty = False
@@ -336,9 +337,7 @@ class AuthGQLSession:
         if re.fullmatch(r"ROLLBACK(?:\s+TRANSACTION)?", text, re.I):
             return self.rollback()
 
-        use_match = re.fullmatch(
-            rf"USE\s+GRAPH\s+({_GRAPH_NAME})|USE\s+({_GRAPH_NAME})", text, re.I
-        )
+        use_match = re.fullmatch(rf"USE\s+GRAPH\s+({_GRAPH_NAME})|USE\s+({_GRAPH_NAME})", text, re.I)
         if use_match:
             graph_name = use_match.group(1) or use_match.group(2)
             if graph_name not in self._active_graphs():
@@ -363,7 +362,9 @@ class AuthGQLSession:
             rf"SET\s+PARAM(?:ETER)?\s+({_IDENTIFIER})\s*=\s*(.+)", text, re.I | re.S
         )
         if parameter_match:
-            self.parameters[parameter_match.group(1)] = _parse_json_value(parameter_match.group(2))
+            self.parameters[parameter_match.group(1)] = _parse_json_value(
+                parameter_match.group(2)
+            )
             return {
                 "status": "ok",
                 "parameter": parameter_match.group(1),
@@ -382,7 +383,6 @@ class AuthGQLSession:
                 "catalog": self._mutation_catalog().binding_tables(self.user, full=full),
             }
         if upper == "SHOW METRICS":
-            self._require_admin()
             return {"status": "ok", "metrics": self.last_metrics.to_dict()}
         if upper == "SHOW TRANSACTION":
             return {
@@ -399,7 +399,9 @@ class AuthGQLSession:
         explain_match = re.match(r"EXPLAIN(?:\s+AUTHORIZATION)?\s+(.+)$", text, re.I | re.S)
         if explain_match:
             query = parse_query(explain_match.group(1))
-            analyzer = StaticAnalyzer(self._authorization_catalog(), self.graph_name, self.user)
+            analyzer = StaticAnalyzer(
+                self._authorization_catalog(), self.graph_name, self.user
+            )
             return {"status": "ok", "plan": analyzer.logical_plan(query)}
 
         if re.fullmatch(rf"CREATE\s+ROLE\s+({_IDENTIFIER})", text, re.I):
@@ -422,7 +424,6 @@ class AuthGQLSession:
             return self._execute_drop_policy(text)
 
         query = parse_query(text)
-        validate_query(query, parameters=self.parameters)
         graph = self._active_graph()
         catalog = self._authorization_catalog()
         if query.update_kind and self._transaction_mode == "READ ONLY":
@@ -430,7 +431,9 @@ class AuthGQLSession:
             StaticAnalyzer(catalog, graph.name, self.user, metrics).preflight(query)
             AuthorizationEngine(catalog, graph, self.user, self.parameters, metrics).check_access()
             self.last_metrics = metrics
-            raise ExecutionError("Data modification in a read-only GQL transaction", code="25G03")
+            raise ExecutionError(
+                "Data modification in a read-only GQL transaction", code="25G03"
+            )
         executor = SecureExecutor(
             graph,
             catalog,
@@ -441,11 +444,7 @@ class AuthGQLSession:
         self.last_metrics = result.metrics
         if result.updated and self._in_transaction:
             self._graph_dirty = True
-        response = result.to_dict()
-        if not catalog.object_target_permitted(self.user, "ADMINISTER", Target("GRAPH", "*")):
-            response.pop("metrics", None)
-            response.pop("reference_equal", None)
-        return response
+        return result.to_dict()
 
     # ---------- Authorization administration ----------
 
@@ -480,7 +479,9 @@ class AuthGQLSession:
         role, explicit_kind, member = match.group(1), match.group(2), match.group(3)
         catalog = self._mutation_catalog()
         member_kind = (explicit_kind or ("ROLE" if member in catalog.roles else "USER")).upper()
-        self._mutate_catalog(lambda candidate: candidate.grant_role(role, member, member_kind))
+        self._mutate_catalog(
+            lambda candidate: candidate.grant_role(role, member, member_kind)
+        )
         return {
             "status": "ok",
             "granted_role": role,
@@ -500,7 +501,9 @@ class AuthGQLSession:
         role, explicit_kind, member = match.group(1), match.group(2), match.group(3)
         catalog = self._mutation_catalog()
         member_kind = (explicit_kind or ("ROLE" if member in catalog.roles else "USER")).upper()
-        self._mutate_catalog(lambda candidate: candidate.revoke_role(role, member, member_kind))
+        self._mutate_catalog(
+            lambda candidate: candidate.revoke_role(role, member, member_kind)
+        )
         return {"status": "ok", "revoked_role": role, "member": member}
 
     def _parse_privilege(self, text: str, revoke: bool = False) -> ParsedPrivilege:
@@ -571,12 +574,8 @@ class AuthGQLSession:
                     target_tail[: property_match.start()] + target_tail[property_match.end() :]
                 ).strip()
 
-        actions = frozenset(
-            " ".join(item.upper().split()) for item in action_text.split(",") if item.strip()
-        )
-        if not actions or not all(
-            item == "POLICY REFERENCE" or re.fullmatch(r"[A-Z_]+", item) for item in actions
-        ):
+        actions = frozenset(item.strip().upper() for item in action_text.split(",") if item.strip())
+        if not actions or not all(re.fullmatch(r"[A-Z_]+", item) for item in actions):
             raise ParseError(f"Invalid privilege action list: {action_text!r}")
 
         labels: set[str] = set()
@@ -615,8 +614,12 @@ class AuthGQLSession:
     def _execute_grant_or_deny(self, text: str) -> dict[str, Any]:
         parsed = self._parse_privilege(text)
         effect = "DENY" if text.lstrip().upper().startswith("DENY") else "PERMIT"
-        if parsed.grant_option and (len(parsed.grantees) != 1 or parsed.grantees[0][0] != "USER"):
-            raise ParseError("WITH GRANT OPTION requires exactly one explicitly typed USER grantee")
+        if parsed.grant_option and (
+            len(parsed.grantees) != 1 or parsed.grantees[0][0] != "USER"
+        ):
+            raise ParseError(
+                "WITH GRANT OPTION requires exactly one explicitly typed USER grantee"
+            )
         if effect == "DENY":
             self._require_admin(parsed.target.graph)
         else:
@@ -631,7 +634,10 @@ class AuthGQLSession:
 
         def mutation(catalog: AuthorizationCatalog) -> None:
             for explicit_kind, grantee in parsed.grantees:
-                grantee_kind = explicit_kind or ("ROLE" if grantee in catalog.roles else "USER")
+                grantee_kind = (
+                    explicit_kind
+                    or ("ROLE" if grantee in catalog.roles else "USER")
+                )
                 catalog.add_privilege(
                     PrivilegeFact(
                         grantee=grantee,
@@ -653,7 +659,8 @@ class AuthGQLSession:
             "grantees": [name for _kind, name in parsed.grantees],
             "typed_grantees": [
                 {
-                    "kind": kind or ("ROLE" if name in self._mutation_catalog().roles else "USER"),
+                    "kind": kind
+                    or ("ROLE" if name in self._mutation_catalog().roles else "USER"),
                     "name": name,
                 }
                 for kind, name in parsed.grantees
@@ -668,7 +675,10 @@ class AuthGQLSession:
         def mutation(catalog: AuthorizationCatalog) -> int:
             changed = 0
             for explicit_kind, grantee in parsed.grantees:
-                grantee_kind = explicit_kind or ("ROLE" if grantee in catalog.roles else "USER")
+                grantee_kind = (
+                    explicit_kind
+                    or ("ROLE" if grantee in catalog.roles else "USER")
+                )
                 changed += catalog.revoke_privilege(
                     grantee,
                     parsed.actions,
@@ -716,15 +726,12 @@ class AuthGQLSession:
         phase = next(iter(phases))
         parsed_grantees = _split_names(header.group(6))
         grantees = {grantee for _kind, grantee in parsed_grantees}
+        if len(grantees) != len(parsed_grantees):
+            raise ParseError("A policy cannot name the same grantee more than once")
         catalog_roles = self._mutation_catalog().roles
-        principals = {
-            (kind or ("ROLE" if name in catalog_roles else "USER"), name)
-            for kind, name in parsed_grantees
-        }
-        if len(principals) != len(parsed_grantees):
-            raise ParseError("A policy cannot repeat the same tagged grantee")
         grantee_kinds = {
-            grantee: explicit_kind or ("ROLE" if grantee in catalog_roles else "USER")
+            grantee: explicit_kind
+            or ("ROLE" if grantee in catalog_roles else "USER")
             for explicit_kind, grantee in parsed_grantees
         }
         effect = header.group(7).upper()
@@ -756,9 +763,9 @@ class AuthGQLSession:
                 with_check = tail[opening + 1 : closing].strip()
                 tail = tail[closing + 1 :].strip()
             elif dependency_match:
-                dependencies.update(
-                    {item.strip() for item in dependency_match.group(1).split(",") if item.strip()}
-                )
+                dependencies.update({
+                    item.strip() for item in dependency_match.group(1).split(",") if item.strip()
+                })
                 tail = tail[dependency_match.end() :].strip()
             else:
                 raise ParseError(f"Cannot parse policy clause near: {tail!r}")
@@ -787,10 +794,9 @@ class AuthGQLSession:
             dependencies=dependencies,
             owner=self.user,
             grantee_kinds=grantee_kinds,
-            principals=principals,
         )
         if not self._authorization_catalog().policy_reference_valid(
-            policy, set(self._active_graphs()), descriptors=self._mutation_catalog()
+            policy, set(self._active_graphs())
         ):
             raise AuthorizationError("Invalid policy dependency or POLICY REFERENCE", code="42000")
         self._mutate_catalog(lambda catalog: catalog.add_policy(policy))
@@ -808,10 +814,12 @@ class AuthGQLSession:
         name, enabled = match.group(1), match.group(2).upper() == "ENABLE"
         policy = next((p for p in self._mutation_catalog().policies if p.name == name), None)
         if policy is not None and not self._authorization_catalog().policy_reference_valid(
-            policy, set(self._active_graphs()), descriptors=self._mutation_catalog()
+            policy, set(self._active_graphs())
         ):
             raise AuthorizationError("Invalid policy dependency or POLICY REFERENCE", code="42000")
-        self._mutate_catalog(lambda catalog: catalog.set_policy_enabled(name, enabled))
+        self._mutate_catalog(
+            lambda catalog: catalog.set_policy_enabled(name, enabled)
+        )
         return {"status": "ok", "policy": name, "enabled": enabled}
 
     def _execute_drop_policy(self, text: str) -> dict[str, Any]:
@@ -823,7 +831,11 @@ class AuthGQLSession:
             re.I,
         )
         if not match:
-            raise ParseError("Expected DROP AUTHORIZATION POLICY name [RESTRICT|CASCADE]")
+            raise ParseError(
+                "Expected DROP AUTHORIZATION POLICY name [RESTRICT|CASCADE]"
+            )
         name, behavior = match.group(1), (match.group(2) or "RESTRICT").upper()
-        removed = self._mutate_catalog(lambda catalog: catalog.drop_policy(name, behavior))
+        removed = self._mutate_catalog(
+            lambda catalog: catalog.drop_policy(name, behavior)
+        )
         return {"status": "ok", "dropped_policies": removed, "behavior": behavior}
